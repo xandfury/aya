@@ -395,6 +395,7 @@ fn resolve_symbol(path: &str, symbol: &str) -> Result<u64, ResolveSymbolError> {
                 section.name().map(str::to_owned),
             )
         })?;
-        Ok(sym.address() - section.address() + offset)
+        // println!("sym.address() = {}; section.address() = {}; offset ={}", sym.address(), section.address(), offset);
+        Ok(sym.address() + offset - section.address())
     }
 }
