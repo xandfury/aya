@@ -1,9 +1,11 @@
 //! Cgroup socket option programs.
+
 pub use aya_obj::programs::CgroupSockoptAttachType;
 
+use crate::util::KernelVersion;
 use std::{
     hash::Hash,
-    os::unix::prelude::{AsRawFd, RawFd},
+    os::fd::{AsRawFd, RawFd},
     path::Path,
 };
 
@@ -12,7 +14,8 @@ use crate::{
     programs::{
         define_link_wrapper, load_program, FdLink, Link, ProgAttachLink, ProgramData, ProgramError,
     },
-    sys::{bpf_link_create, bpf_prog_attach, kernel_version},
+    sys::{bpf_link_create, bpf_prog_attach},
+    VerifierLogLevel,
 };
 
 /// A program that can be used to get or set options on sockets.
@@ -69,11 +72,10 @@ impl CgroupSockopt {
         let prog_fd = self.data.fd_or_err()?;
         let cgroup_fd = cgroup.as_raw_fd();
         let attach_type = self.data.expected_attach_type.unwrap();
-        let k_ver = kernel_version().unwrap();
-        if k_ver >= (5, 7, 0) {
+        if KernelVersion::current().unwrap() >= KernelVersion::new(5, 7, 0) {
             let link_fd = bpf_link_create(prog_fd, cgroup_fd, attach_type, None, 0).map_err(
                 |(_, io_error)| ProgramError::SyscallError {
-                    call: "bpf_link_create".to_owned(),
+                    call: "bpf_link_create",
                     io_error,
                 },
             )? as RawFd;
@@ -85,7 +87,7 @@ impl CgroupSockopt {
         } else {
             bpf_prog_attach(prog_fd, cgroup_fd, attach_type).map_err(|(_, io_error)| {
                 ProgramError::SyscallError {
-                    call: "bpf_prog_attach".to_owned(),
+                    call: "bpf_prog_attach",
                     io_error,
                 }
             })?;
@@ -126,7 +128,7 @@ impl CgroupSockopt {
         path: P,
         attach_type: CgroupSockoptAttachType,
     ) -> Result<Self, ProgramError> {
-        let data = ProgramData::from_pinned_path(path)?;
+        let data = ProgramData::from_pinned_path(path, VerifierLogLevel::default())?;
         Ok(Self { data, attach_type })
     }
 }

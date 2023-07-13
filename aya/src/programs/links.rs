@@ -6,7 +6,7 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     ffi::CString,
     io,
-    os::unix::prelude::RawFd,
+    os::fd::RawFd,
     path::{Path, PathBuf},
 };
 
@@ -16,6 +16,10 @@ use crate::{
     programs::ProgramError,
     sys::{bpf_get_object, bpf_pin_object, bpf_prog_detach},
 };
+
+// for docs link
+#[allow(unused)]
+use crate::programs::cgroup_skb::CgroupSkb;
 
 /// A Link.
 pub trait Link: std::fmt::Debug + 'static {
@@ -82,6 +86,30 @@ impl<T: Link> Drop for LinkMap<T> {
 pub struct FdLinkId(pub(crate) RawFd);
 
 /// A file descriptor link.
+///
+/// Fd links are returned directly when attaching some program types (for
+/// instance [`CgroupSkb`]), or can be obtained by converting other link
+/// types (see the `TryFrom` implementations).
+///
+/// An important property of fd links is that they can be pinned. Pinning
+/// can be used keep a link attached "in background" even after the program
+/// that has created the link terminates.
+///
+/// # Example
+///
+///```no_run
+/// # let mut bpf = Bpf::load_file("ebpf_programs.o")?;
+/// use aya::{Bpf, programs::{links::FdLink, KProbe}};
+///
+/// let program: &mut KProbe = bpf.program_mut("intercept_wakeups").unwrap().try_into()?;
+/// program.load()?;
+/// let link_id = program.attach("try_to_wake_up", 0)?;
+/// let link = program.take_link(link_id).unwrap();
+/// let fd_link: FdLink = link.try_into().unwrap();
+/// fd_link.pin("/sys/fs/bpf/intercept_wakeups_link").unwrap();
+///
+/// # Ok::<(), aya::BpfError>(())
+/// ```
 #[derive(Debug)]
 pub struct FdLink {
     pub(crate) fd: RawFd,
@@ -129,7 +157,7 @@ impl FdLink {
                 }
             })?;
         bpf_pin_object(self.fd, &path_string).map_err(|(_, io_error)| PinError::SyscallError {
-            name: "BPF_OBJ_PIN".to_string(),
+            name: "BPF_OBJ_PIN",
             io_error,
         })?;
         Ok(PinnedLink::new(PathBuf::from(path.as_ref()), self))
@@ -186,7 +214,7 @@ impl PinnedLink {
         let path_string = CString::new(path.as_ref().to_string_lossy().to_string()).unwrap();
         let fd =
             bpf_get_object(&path_string).map_err(|(code, io_error)| LinkError::SyscallError {
-                call: "BPF_OBJ_GET".to_string(),
+                call: "BPF_OBJ_GET",
                 code,
                 io_error,
             })? as RawFd;
@@ -318,7 +346,7 @@ pub enum LinkError {
     #[error("the `{call}` syscall failed with code {code}")]
     SyscallError {
         /// Syscall Name.
-        call: String,
+        call: &'static str,
         /// Error code.
         code: libc::c_long,
         #[source]
@@ -329,6 +357,7 @@ pub enum LinkError {
 
 #[cfg(test)]
 mod tests {
+    use matches::assert_matches;
     use std::{cell::RefCell, env, fs::File, mem, os::unix::io::AsRawFd, rc::Rc};
 
     use crate::{programs::ProgramError, sys::override_syscall};
@@ -394,10 +423,10 @@ mod tests {
         let mut links = LinkMap::new();
 
         links.insert(TestLink::new(1, 2)).unwrap();
-        assert!(matches!(
+        assert_matches!(
             links.insert(TestLink::new(1, 2)),
             Err(ProgramError::AlreadyAttached)
-        ));
+        );
     }
 
     #[test]
@@ -409,10 +438,7 @@ mod tests {
         let l1_id2 = l1.id();
         links.insert(TestLink::new(1, 2)).unwrap();
         links.remove(l1_id1).unwrap();
-        assert!(matches!(
-            links.remove(l1_id2),
-            Err(ProgramError::NotAttached)
-        ));
+        assert_matches!(links.remove(l1_id2), Err(ProgramError::NotAttached));
     }
 
     #[test]

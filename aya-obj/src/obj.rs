@@ -42,22 +42,74 @@ const KERNEL_VERSION_ANY: u32 = 0xFFFF_FFFE;
 #[derive(Default, Debug)]
 #[allow(missing_docs)]
 pub struct Features {
-    pub bpf_name: bool,
-    pub bpf_probe_read_kernel: bool,
-    pub bpf_perf_link: bool,
-    pub bpf_global_data: bool,
-    pub btf: Option<BtfFeatures>,
+    bpf_name: bool,
+    bpf_probe_read_kernel: bool,
+    bpf_perf_link: bool,
+    bpf_global_data: bool,
+    bpf_cookie: bool,
+    btf: Option<BtfFeatures>,
+}
+
+impl Features {
+    #[doc(hidden)]
+    pub fn new(
+        bpf_name: bool,
+        bpf_probe_read_kernel: bool,
+        bpf_perf_link: bool,
+        bpf_global_data: bool,
+        bpf_cookie: bool,
+        btf: Option<BtfFeatures>,
+    ) -> Self {
+        Self {
+            bpf_name,
+            bpf_probe_read_kernel,
+            bpf_perf_link,
+            bpf_global_data,
+            bpf_cookie,
+            btf,
+        }
+    }
+
+    /// Returns whether BPF program names are supported.
+    pub fn bpf_name(&self) -> bool {
+        self.bpf_name
+    }
+
+    /// Returns whether the bpf_probe_read_kernel helper is supported.
+    pub fn bpf_probe_read_kernel(&self) -> bool {
+        self.bpf_probe_read_kernel
+    }
+
+    /// Returns whether bpf_links are supported for Kprobes/Uprobes/Tracepoints.
+    pub fn bpf_perf_link(&self) -> bool {
+        self.bpf_perf_link
+    }
+
+    /// Returns whether BPF program global data is supported.
+    pub fn bpf_global_data(&self) -> bool {
+        self.bpf_global_data
+    }
+
+    /// Returns whether BPF program cookie is supported.
+    pub fn bpf_cookie(&self) -> bool {
+        self.bpf_cookie
+    }
+
+    /// If BTF is supported, returns which BTF features are supported.
+    pub fn btf(&self) -> Option<&BtfFeatures> {
+        self.btf.as_ref()
+    }
 }
 
 /// The loaded object file representation
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Object {
     /// The endianness
     pub endianness: Endianness,
     /// Program license
     pub license: CString,
     /// Kernel version
-    pub kernel_version: KernelVersion,
+    pub kernel_version: Option<u32>,
     /// Program BTF
     pub btf: Option<Btf>,
     /// Program BTF.ext
@@ -83,7 +135,7 @@ pub struct Program {
     /// The license
     pub license: CString,
     /// The kernel version
-    pub kernel_version: KernelVersion,
+    pub kernel_version: Option<u32>,
     /// The section containing the program
     pub section: ProgramSection,
     /// The section index of the program
@@ -527,7 +579,7 @@ impl Object {
         let kernel_version = if let Some(section) = obj.section_by_name("version") {
             parse_version(Section::try_from(&section)?.data, endianness)?
         } else {
-            KernelVersion::Any
+            None
         };
 
         let mut bpf_obj = Object::new(endianness, license, kernel_version);
@@ -579,7 +631,7 @@ impl Object {
         Ok(bpf_obj)
     }
 
-    fn new(endianness: Endianness, license: CString, kernel_version: KernelVersion) -> Object {
+    fn new(endianness: Endianness, license: CString, kernel_version: Option<u32>) -> Object {
         Object {
             endianness,
             license,
@@ -597,7 +649,10 @@ impl Object {
     }
 
     /// Patches map data
-    pub fn patch_map_data(&mut self, globals: HashMap<&str, &[u8]>) -> Result<(), ParseError> {
+    pub fn patch_map_data(
+        &mut self,
+        globals: HashMap<&str, (&[u8], bool)>,
+    ) -> Result<(), ParseError> {
         let symbols: HashMap<String, &Symbol> = self
             .symbol_table
             .iter()
@@ -605,7 +660,7 @@ impl Object {
             .map(|(_, s)| (s.name.as_ref().unwrap().clone(), s))
             .collect();
 
-        for (name, data) in globals {
+        for (name, (data, must_exist)) in globals {
             if let Some(symbol) = symbols.get(name) {
                 if data.len() as u64 != symbol.size {
                     return Err(ParseError::InvalidGlobalData {
@@ -633,7 +688,7 @@ impl Object {
                     });
                 }
                 map.data_mut().splice(start..end, data.iter().cloned());
-            } else {
+            } else if must_exist {
                 return Err(ParseError::SymbolNotFound {
                     name: name.to_owned(),
                 });
@@ -1201,7 +1256,7 @@ fn parse_license(data: &[u8]) -> Result<CString, ParseError> {
         .to_owned())
 }
 
-fn parse_version(data: &[u8], endianness: object::Endianness) -> Result<KernelVersion, ParseError> {
+fn parse_version(data: &[u8], endianness: object::Endianness) -> Result<Option<u32>, ParseError> {
     let data = match data.len() {
         4 => data.try_into().unwrap(),
         _ => {
@@ -1216,9 +1271,10 @@ fn parse_version(data: &[u8], endianness: object::Endianness) -> Result<KernelVe
         object::Endianness::Little => u32::from_le_bytes(data),
     };
 
-    Ok(match v {
-        KERNEL_VERSION_ANY => KernelVersion::Any,
-        v => KernelVersion::Version(v),
+    Ok(if v == KERNEL_VERSION_ANY {
+        None
+    } else {
+        Some(v)
     })
 }
 
@@ -1244,24 +1300,6 @@ fn get_map_field(btf: &Btf, type_id: u32) -> Result<u32, BtfError> {
         }
     };
     Ok(arr.len)
-}
-
-/// The parsed kernel version
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum KernelVersion {
-    /// Specified version
-    Version(u32),
-    /// Any version
-    Any,
-}
-
-impl From<KernelVersion> for u32 {
-    fn from(version: KernelVersion) -> u32 {
-        match version {
-            KernelVersion::Any => KERNEL_VERSION_ANY,
-            KernelVersion::Version(v) => v,
-        }
-    }
 }
 
 // Parsed '.bss' '.data' and '.rodata' sections. These sections are arrays of
@@ -1499,69 +1537,57 @@ mod tests {
 
     #[test]
     fn test_parse_generic_error() {
-        assert!(matches!(
-            Object::parse(&b"foo"[..]),
-            Err(ParseError::ElfError(_))
-        ))
+        assert_matches!(Object::parse(&b"foo"[..]), Err(ParseError::ElfError(_)))
     }
 
     #[test]
     fn test_parse_license() {
-        assert!(matches!(
-            parse_license(b""),
-            Err(ParseError::InvalidLicense { .. })
-        ));
+        assert_matches!(parse_license(b""), Err(ParseError::InvalidLicense { .. }));
 
-        assert!(matches!(
-            parse_license(b"\0"),
-            Err(ParseError::InvalidLicense { .. })
-        ));
+        assert_matches!(parse_license(b"\0"), Err(ParseError::InvalidLicense { .. }));
 
-        assert!(matches!(
+        assert_matches!(
             parse_license(b"GPL"),
             Err(ParseError::MissingLicenseNullTerminator { .. })
-        ));
+        );
 
         assert_eq!(parse_license(b"GPL\0").unwrap().to_str().unwrap(), "GPL");
     }
 
     #[test]
     fn test_parse_version() {
-        assert!(matches!(
+        assert_matches!(
             parse_version(b"", Endianness::Little),
             Err(ParseError::InvalidKernelVersion { .. })
-        ));
+        );
 
-        assert!(matches!(
+        assert_matches!(
             parse_version(b"123", Endianness::Little),
             Err(ParseError::InvalidKernelVersion { .. })
-        ));
-
-        assert_eq!(
-            parse_version(&0xFFFF_FFFEu32.to_le_bytes(), Endianness::Little)
-                .expect("failed to parse magic version"),
-            KernelVersion::Any
         );
 
-        assert_eq!(
-            parse_version(&0xFFFF_FFFEu32.to_be_bytes(), Endianness::Big)
-                .expect("failed to parse magic version"),
-            KernelVersion::Any
+        assert_matches!(
+            parse_version(&0xFFFF_FFFEu32.to_le_bytes(), Endianness::Little),
+            Ok(None)
         );
 
-        assert_eq!(
-            parse_version(&1234u32.to_le_bytes(), Endianness::Little)
-                .expect("failed to parse magic version"),
-            KernelVersion::Version(1234)
+        assert_matches!(
+            parse_version(&0xFFFF_FFFEu32.to_be_bytes(), Endianness::Big),
+            Ok(None)
+        );
+
+        assert_matches!(
+            parse_version(&1234u32.to_le_bytes(), Endianness::Little),
+            Ok(Some(1234))
         );
     }
 
     #[test]
     fn test_parse_map_def_error() {
-        assert!(matches!(
+        assert_matches!(
             parse_map_def("foo", &[]),
             Err(ParseError::InvalidMapDefinition { .. })
-        ));
+        );
     }
 
     #[test]
@@ -1617,7 +1643,7 @@ mod tests {
     #[test]
     fn test_parse_map_data() {
         let map_data = b"map data";
-        assert!(matches!(
+        assert_matches!(
             parse_data_map_section(
                 &fake_section(
                     BpfSectionKind::Data,
@@ -1640,15 +1666,11 @@ mod tests {
                 },
                 data,
             })) if data == map_data && value_size == map_data.len() as u32
-        ))
+        )
     }
 
     fn fake_obj() -> Object {
-        Object::new(
-            Endianness::Little,
-            CString::new("GPL").unwrap(),
-            KernelVersion::Any,
-        )
+        Object::new(Endianness::Little, CString::new("GPL").unwrap(), None)
     }
 
     #[test]
@@ -1698,7 +1720,7 @@ mod tests {
             obj.parse_program(&fake_section(BpfSectionKind::Program,"kprobe/foo", bytes_of(&fake_ins()))),
             Ok((Program {
                 license,
-                kernel_version: KernelVersion::Any,
+                kernel_version: None,
                 section: ProgramSection::KProbe { .. },
                 .. }, Function {
                     name,
@@ -2323,7 +2345,7 @@ mod tests {
     fn test_patch_map_data() {
         let mut obj = fake_obj();
         obj.maps.insert(
-            ".rodata".to_string(),
+            ".rodata".to_owned(),
             Map::Legacy(LegacyMap {
                 def: bpf_map_def {
                     map_type: BPF_MAP_TYPE_ARRAY as u32,
@@ -2345,7 +2367,7 @@ mod tests {
             Symbol {
                 index: 1,
                 section_index: Some(1),
-                name: Some("my_config".to_string()),
+                name: Some("my_config".to_owned()),
                 address: 0,
                 size: 3,
                 is_definition: true,
@@ -2354,8 +2376,11 @@ mod tests {
         );
 
         let test_data: &[u8] = &[1, 2, 3];
-        obj.patch_map_data(HashMap::from([("my_config", test_data)]))
-            .unwrap();
+        obj.patch_map_data(HashMap::from([
+            ("my_config", (test_data, true)),
+            ("optional_variable", (test_data, false)),
+        ]))
+        .unwrap();
 
         let map = obj.maps.get(".rodata").unwrap();
         assert_eq!(test_data, map.data());

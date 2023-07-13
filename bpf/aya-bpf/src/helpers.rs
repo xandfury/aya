@@ -13,7 +13,10 @@ pub use aya_bpf_bindings::helpers as gen;
 #[doc(hidden)]
 pub use gen::*;
 
-use crate::cty::{c_char, c_long, c_void};
+use crate::{
+    check_bounds_signed,
+    cty::{c_char, c_long, c_void},
+};
 
 /// Read bytes stored at `src` and store them as a `T`.
 ///
@@ -269,17 +272,9 @@ pub unsafe fn bpf_probe_read_str(src: *const u8, dest: &mut [u8]) -> Result<usiz
         dest.len() as u32,
         src as *const c_void,
     );
-    if len < 0 {
-        return Err(-1);
-    }
-
-    let mut len = len as usize;
-    if len > dest.len() {
-        // this can never happen, it's needed to tell the verifier that len is
-        // bounded
-        len = dest.len();
-    }
-    Ok(len)
+    let len = usize::try_from(len).map_err(|core::num::TryFromIntError { .. }| -1)?;
+    // this can never happen, it's needed to tell the verifier that len is bounded.
+    Ok(len.min(dest.len()))
 }
 
 /// Read a null-terminated string from _user space_ stored at `src` into `dest`.
@@ -313,17 +308,9 @@ pub unsafe fn bpf_probe_read_user_str(src: *const u8, dest: &mut [u8]) -> Result
         dest.len() as u32,
         src as *const c_void,
     );
-    if len < 0 {
-        return Err(-1);
-    }
-
-    let mut len = len as usize;
-    if len > dest.len() {
-        // this can never happen, it's needed to tell the verifier that len is
-        // bounded
-        len = dest.len();
-    }
-    Ok(len)
+    let len = usize::try_from(len).map_err(|core::num::TryFromIntError { .. }| -1)?;
+    // this can never happen, it's needed to tell the verifier that len is bounded.
+    Ok(len.min(dest.len()))
 }
 
 /// Returns a byte slice read from _user space_ address `src`.
@@ -419,19 +406,25 @@ pub unsafe fn bpf_probe_read_user_str_bytes(
         dest.len() as u32,
         src as *const c_void,
     );
-    if len <= 0 {
+
+    read_str_bytes(len, dest)
+}
+
+fn read_str_bytes(len: i64, dest: &mut [u8]) -> Result<&[u8], c_long> {
+    // The lower bound is 0, since it's what is returned for b"\0". See the
+    // bpf_probe_read_user_[user|kernel]_bytes_empty integration tests.  The upper bound
+    // check is not needed since the helper truncates, but the verifier doesn't
+    // know that so we show it the upper bound.
+    if !check_bounds_signed(len, 0, dest.len() as i64) {
         return Err(-1);
     }
 
-    let len = len as usize;
-    if len >= dest.len() {
-        // this can never happen, it's needed to tell the verifier that len is
-        // bounded
-        return Err(-1);
-    }
-
-    // len includes NULL byte
-    Ok(&dest[..len - 1])
+    // len includes the NULL terminator but not for b"\0" for which the kernel
+    // returns len=0. So we do a saturating sub and for b"\0" we return the
+    // empty slice, for all other cases we omit the terminator.
+    let len = usize::try_from(len).map_err(|core::num::TryFromIntError { .. }| -1)?;
+    let len = len.saturating_sub(1);
+    dest.get(..len).ok_or(-1)
 }
 
 /// Read a null-terminated string from _kernel space_ stored at `src` into `dest`.
@@ -465,17 +458,9 @@ pub unsafe fn bpf_probe_read_kernel_str(src: *const u8, dest: &mut [u8]) -> Resu
         dest.len() as u32,
         src as *const c_void,
     );
-    if len < 0 {
-        return Err(-1);
-    }
-
-    let mut len = len as usize;
-    if len > dest.len() {
-        // this can never happen, it's needed to tell the verifier that len is
-        // bounded
-        len = dest.len();
-    }
-    Ok(len)
+    let len = usize::try_from(len).map_err(|core::num::TryFromIntError { .. }| -1)?;
+    // this can never happen, it's needed to tell the verifier that len is bounded.
+    Ok(len.min(dest.len()))
 }
 
 /// Returns a byte slice read from _kernel space_ address `src`.
@@ -572,19 +557,8 @@ pub unsafe fn bpf_probe_read_kernel_str_bytes(
         dest.len() as u32,
         src as *const c_void,
     );
-    if len <= 0 {
-        return Err(-1);
-    }
 
-    let len = len as usize;
-    if len >= dest.len() {
-        // this can never happen, it's needed to tell the verifier that len is
-        // bounded
-        return Err(-1);
-    }
-
-    // len includes NULL byte
-    Ok(&dest[..len - 1])
+    read_str_bytes(len, dest)
 }
 
 /// Write bytes to the _user space_ pointer `src` and store them as a `T`.

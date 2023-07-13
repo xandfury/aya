@@ -1,18 +1,10 @@
-use std::{process::exit, time::Duration};
+use std::time::Duration;
 
-use aya::{
-    include_bytes_aligned,
-    programs::{ProgramError, UProbe},
-    Bpf,
-};
-use integration_test_macros::integration_test;
+use aya::{programs::UProbe, Bpf};
 
-#[integration_test]
+#[test]
 fn relocations() {
-    let bpf = load_and_attach(
-        "test_64_32_call_relocs",
-        include_bytes_aligned!("../../../../target/bpfel-unknown-none/release/relocations"),
-    );
+    let bpf = load_and_attach("test_64_32_call_relocs", crate::RELOCATIONS);
 
     trigger_relocations_program();
     std::thread::sleep(Duration::from_millis(100));
@@ -23,12 +15,9 @@ fn relocations() {
     assert_eq!(m.get(&2, 0).unwrap(), 3);
 }
 
-#[integration_test]
+#[test]
 fn text_64_64_reloc() {
-    let mut bpf = load_and_attach(
-        "test_text_64_64_reloc",
-        include_bytes_aligned!("../../../../target/bpfel-unknown-none/release/text_64_64_reloc.o"),
-    );
+    let mut bpf = load_and_attach("test_text_64_64_reloc", crate::TEXT_64_64_RELOC);
 
     let mut m = aya::maps::Array::<_, u64>::try_from(bpf.map_mut("RESULTS").unwrap()).unwrap();
     m.set(0, 1, 0).unwrap();
@@ -45,14 +34,7 @@ fn load_and_attach(name: &str, bytes: &[u8]) -> Bpf {
     let mut bpf = Bpf::load(bytes).unwrap();
 
     let prog: &mut UProbe = bpf.program_mut(name).unwrap().try_into().unwrap();
-    if let Err(ProgramError::LoadError {
-        io_error,
-        verifier_log,
-    }) = prog.load()
-    {
-        println!("Failed to load program `{name}`: {io_error}. Verifier log:\n{verifier_log:#}");
-        exit(1);
-    };
+    prog.load().unwrap();
 
     prog.attach(
         Some("trigger_relocations_program"),

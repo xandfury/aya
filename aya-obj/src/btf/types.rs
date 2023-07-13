@@ -388,9 +388,9 @@ impl Int {
 
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub(crate) struct BtfEnum {
-    pub(crate) name_offset: u32,
-    pub(crate) value: u32,
+pub struct BtfEnum {
+    pub name_offset: u32,
+    pub value: u32,
 }
 
 #[repr(C)]
@@ -423,7 +423,7 @@ impl Enum {
         mem::size_of::<Fwd>() + mem::size_of::<BtfEnum>() * self.variants.len()
     }
 
-    pub(crate) fn new(name_offset: u32, variants: Vec<BtfEnum>) -> Self {
+    pub fn new(name_offset: u32, variants: Vec<BtfEnum>) -> Self {
         let mut info = (BtfKind::Enum as u32) << 24;
         info |= (variants.len() as u32) & 0xFFFF;
         Enum {
@@ -1724,11 +1724,11 @@ mod tests {
     #[test]
     fn test_types_are_compatible() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("u32".to_string());
+        let name_offset = btf.add_string("u32");
         let u32t = btf.add_type(BtfType::Int(Int::new(name_offset, 4, IntEncoding::None, 0)));
-        let name_offset = btf.add_string("u64".to_string());
+        let name_offset = btf.add_string("u64");
         let u64t = btf.add_type(BtfType::Int(Int::new(name_offset, 8, IntEncoding::None, 0)));
-        let name_offset = btf.add_string("widgets".to_string());
+        let name_offset = btf.add_string("widgets");
         let array_type = btf.add_type(BtfType::Array(Array::new(name_offset, u64t, u32t, 16)));
 
         assert!(types_are_compatible(&btf, u32t, &btf, u32t).unwrap());

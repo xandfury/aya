@@ -242,10 +242,7 @@ fn relocate_maps<'a, I: Iterator<Item = &'a Relocation>>(
             m
         } else {
             let Some(m) = maps_by_section.get(&section_index) else {
-                debug!(
-                    "failed relocating map by section index {}",
-                    section_index
-                );
+                debug!("failed relocating map by section index {}", section_index);
                 return Err(RelocationError::SectionNotFound {
                     symbol_index: rel.symbol_index,
                     symbol_name: sym.name.clone(),
@@ -264,7 +261,7 @@ fn relocate_maps<'a, I: Iterator<Item = &'a Relocation>>(
             debug_assert!(matches!(
                 map.section_kind(),
                 BpfSectionKind::Bss | BpfSectionKind::Data | BpfSectionKind::Rodata
-            ),);
+            ));
             m
         };
         debug_assert_eq!(map.section_index(), section_index);
@@ -583,7 +580,7 @@ mod test {
 
         let symbol_table = HashMap::from([(1, fake_sym(1, 0, 0, "test_map", 0))]);
 
-        let relocations = vec![Relocation {
+        let relocations = [Relocation {
             offset: 0x0,
             symbol_index: 1,
             size: 64,
@@ -628,7 +625,7 @@ mod test {
             (2, fake_sym(2, 0, 0, "test_map_2", 0)),
         ]);
 
-        let relocations = vec![
+        let relocations = [
             Relocation {
                 offset: 0x0,
                 symbol_index: 1,
@@ -678,7 +675,7 @@ mod test {
 
         let symbol_table = HashMap::from([(1, fake_sym(1, 0, 0, "test_map", 0))]);
 
-        let relocations = vec![Relocation {
+        let relocations = [Relocation {
             offset: 0x0,
             symbol_index: 1,
             size: 64,
@@ -723,7 +720,7 @@ mod test {
             (2, fake_sym(2, 0, 0, "test_map_2", 0)),
         ]);
 
-        let relocations = vec![
+        let relocations = [
             Relocation {
                 offset: 0x0,
                 symbol_index: 1,

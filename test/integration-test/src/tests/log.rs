@@ -1,11 +1,9 @@
 use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 
-use aya::{include_bytes_aligned, programs::UProbe, Bpf};
+use aya::{programs::UProbe, Bpf};
 use aya_log::BpfLogger;
 use log::{Level, Log, Record};
 use tokio::time::{sleep, Duration};
-
-use super::tokio_integration_test;
 
 const MAX_ATTEMPTS: usize = 10;
 const TIMEOUT_MS: u64 = 10;
@@ -89,10 +87,9 @@ impl Log for TestingLogger {
     }
 }
 
-#[tokio_integration_test]
+#[tokio::test]
 async fn log() {
-    let bytes = include_bytes_aligned!("../../../../target/bpfel-unknown-none/release/log");
-    let mut bpf = Bpf::load(bytes).unwrap();
+    let mut bpf = Bpf::load(crate::LOG).unwrap();
 
     let (logger, captured_logs) = TestingLogger::with_capacity(5);
     BpfLogger::init_with_logger(&mut bpf, logger).unwrap();

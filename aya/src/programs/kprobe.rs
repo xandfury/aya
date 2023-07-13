@@ -3,13 +3,15 @@ use std::{io, path::Path};
 use thiserror::Error;
 
 use crate::{
-    generated::bpf_prog_type::BPF_PROG_TYPE_KPROBE,
+    generated::{bpf_link_type, bpf_prog_type::BPF_PROG_TYPE_KPROBE},
     programs::{
         define_link_wrapper, load_program,
         perf_attach::{PerfLinkIdInner, PerfLinkInner},
         probe::{attach, ProbeKind},
-        ProgramData, ProgramError,
+        FdLink, LinkError, ProgramData, ProgramError,
     },
+    sys::bpf_link_get_info_by_fd,
+    VerifierLogLevel,
 };
 
 /// A kernel probe.
@@ -91,7 +93,7 @@ impl KProbe {
     /// On drop, any managed links are detached and the program is unloaded. This will not result in
     /// the program being unloaded from the kernel if it is still pinned.
     pub fn from_pin<P: AsRef<Path>>(path: P, kind: ProbeKind) -> Result<Self, ProgramError> {
-        let data = ProgramData::from_pinned_path(path)?;
+        let data = ProgramData::from_pinned_path(path, VerifierLogLevel::default())?;
         Ok(Self { data, kind })
     }
 }
@@ -117,4 +119,33 @@ pub enum KProbeError {
         #[source]
         io_error: io::Error,
     },
+}
+
+impl TryFrom<KProbeLink> for FdLink {
+    type Error = LinkError;
+
+    fn try_from(value: KProbeLink) -> Result<Self, Self::Error> {
+        if let PerfLinkInner::FdLink(fd) = value.into_inner() {
+            Ok(fd)
+        } else {
+            Err(LinkError::InvalidLink)
+        }
+    }
+}
+
+impl TryFrom<FdLink> for KProbeLink {
+    type Error = LinkError;
+
+    fn try_from(fd_link: FdLink) -> Result<Self, Self::Error> {
+        let info =
+            bpf_link_get_info_by_fd(fd_link.fd).map_err(|io_error| LinkError::SyscallError {
+                call: "BPF_OBJ_GET_INFO_BY_FD",
+                code: 0,
+                io_error,
+            })?;
+        if info.type_ == (bpf_link_type::BPF_LINK_TYPE_KPROBE_MULTI as u32) {
+            return Ok(KProbeLink::new(PerfLinkInner::FdLink(fd_link)));
+        }
+        Err(LinkError::InvalidLink)
+    }
 }

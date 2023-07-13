@@ -7,6 +7,7 @@ use std::{
     slice,
 };
 
+use crate::util::KernelVersion;
 use libc::{c_char, c_long, close, ENOENT, ENOSPC};
 use obj::{
     maps::{bpf_map_def, LegacyMap},
@@ -27,12 +28,16 @@ use crate::{
         },
         copy_instructions,
     },
-    sys::{kernel_version, syscall, SysResult, Syscall},
-    util::VerifierLog,
-    Btf, Pod, BPF_OBJ_NAME_LEN,
+    sys::{syscall, SysResult, Syscall},
+    Btf, Pod, VerifierLogLevel, BPF_OBJ_NAME_LEN,
 };
 
-pub(crate) fn bpf_create_map(name: &CStr, def: &obj::Map, btf_fd: Option<RawFd>) -> SysResult {
+pub(crate) fn bpf_create_map(
+    name: &CStr,
+    def: &obj::Map,
+    btf_fd: Option<RawFd>,
+    kernel_version: KernelVersion,
+) -> SysResult {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     let u = unsafe { &mut attr.__bindgen_anon_1 };
@@ -78,8 +83,7 @@ pub(crate) fn bpf_create_map(name: &CStr, def: &obj::Map, btf_fd: Option<RawFd>)
     // https://github.com/torvalds/linux/commit/ad5b177bd73f5107d97c36f56395c4281fb6f089
     // The map name was added as a parameter in kernel 4.15+ so we skip adding it on
     // older kernels for compatibility
-    let k_ver = kernel_version().unwrap();
-    if k_ver >= (4, 15, 0) {
+    if kernel_version >= KernelVersion::new(4, 15, 0) {
         // u.map_name is 16 bytes max and must be NULL terminated
         let name_len = cmp::min(name.to_bytes().len(), BPF_OBJ_NAME_LEN - 1);
         u.map_name[..name_len]
@@ -124,8 +128,8 @@ pub(crate) struct BpfLoadProgramAttrs<'a> {
 
 pub(crate) fn bpf_load_program(
     aya_attr: &BpfLoadProgramAttrs,
-    logger: &mut VerifierLog,
-    verifier_log_level: u32,
+    log_buf: &mut [u8],
+    verifier_log_level: VerifierLogLevel,
 ) -> SysResult {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
@@ -169,11 +173,10 @@ pub(crate) fn bpf_load_program(
             u.func_info_rec_size = aya_attr.func_info_rec_size as u32;
         }
     }
-    let log_buf = logger.buf();
-    if log_buf.capacity() > 0 {
-        u.log_level = verifier_log_level;
+    if !log_buf.is_empty() {
+        u.log_level = verifier_log_level.bits();
         u.log_buf = log_buf.as_mut_ptr() as u64;
-        u.log_size = log_buf.capacity() as u32;
+        u.log_size = log_buf.len() as u32;
     }
     if let Some(v) = aya_attr.attach_btf_obj_fd {
         u.__bindgen_anon_1.attach_btf_obj_fd = v;
@@ -544,16 +547,19 @@ pub(crate) fn bpf_raw_tracepoint_open(name: Option<&CStr>, prog_fd: RawFd) -> Sy
     sys_bpf(bpf_cmd::BPF_RAW_TRACEPOINT_OPEN, &attr)
 }
 
-pub(crate) fn bpf_load_btf(raw_btf: &[u8], log: &mut VerifierLog) -> SysResult {
+pub(crate) fn bpf_load_btf(
+    raw_btf: &[u8],
+    log_buf: &mut [u8],
+    verifier_log_level: VerifierLogLevel,
+) -> SysResult {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     let u = unsafe { &mut attr.__bindgen_anon_7 };
     u.btf = raw_btf.as_ptr() as *const _ as u64;
     u.btf_size = mem::size_of_val(raw_btf) as u32;
-    let log_buf = log.buf();
-    if log_buf.capacity() > 0 {
-        u.btf_log_level = 1;
+    if !log_buf.is_empty() {
+        u.btf_log_level = verifier_log_level.bits();
         u.btf_log_buf = log_buf.as_mut_ptr() as u64;
-        u.btf_log_size = log_buf.capacity() as u32;
+        u.btf_log_size = log_buf.len() as u32;
     }
     sys_bpf(bpf_cmd::BPF_BTF_LOAD, &attr)
 }
@@ -719,9 +725,36 @@ pub(crate) fn is_bpf_global_data_supported() -> bool {
     false
 }
 
+pub(crate) fn is_bpf_cookie_supported() -> bool {
+    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
+    let u = unsafe { &mut attr.__bindgen_anon_3 };
+
+    let prog: &[u8] = &[
+        0x85, 0x00, 0x00, 0x00, 0xae, 0x00, 0x00, 0x00, // call bpf_get_attach_cookie
+        0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
+    ];
+
+    let gpl = b"GPL\0";
+    u.license = gpl.as_ptr() as u64;
+
+    let insns = copy_instructions(prog).unwrap();
+    u.insn_cnt = insns.len() as u32;
+    u.insns = insns.as_ptr() as u64;
+    u.prog_type = bpf_prog_type::BPF_PROG_TYPE_KPROBE as u32;
+
+    match sys_bpf(bpf_cmd::BPF_PROG_LOAD, &attr) {
+        Ok(v) => {
+            let fd = v as RawFd;
+            unsafe { close(fd) };
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn is_btf_supported() -> bool {
     let mut btf = Btf::new();
-    let name_offset = btf.add_string("int".to_string());
+    let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
     btf.add_type(int_type);
     let btf_bytes = btf.to_bytes();
@@ -743,12 +776,12 @@ pub(crate) fn is_btf_supported() -> bool {
 
 pub(crate) fn is_btf_func_supported() -> bool {
     let mut btf = Btf::new();
-    let name_offset = btf.add_string("int".to_string());
+    let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
     let int_type_id = btf.add_type(int_type);
 
-    let a_name = btf.add_string("a".to_string());
-    let b_name = btf.add_string("b".to_string());
+    let a_name = btf.add_string("a");
+    let b_name = btf.add_string("b");
     let params = vec![
         BtfParam {
             name_offset: a_name,
@@ -762,7 +795,7 @@ pub(crate) fn is_btf_func_supported() -> bool {
     let func_proto = BtfType::FuncProto(FuncProto::new(params, int_type_id));
     let func_proto_type_id = btf.add_type(func_proto);
 
-    let add = btf.add_string("inc".to_string());
+    let add = btf.add_string("inc");
     let func = BtfType::Func(Func::new(add, func_proto_type_id, FuncLinkage::Static));
     btf.add_type(func);
 
@@ -785,12 +818,12 @@ pub(crate) fn is_btf_func_supported() -> bool {
 
 pub(crate) fn is_btf_func_global_supported() -> bool {
     let mut btf = Btf::new();
-    let name_offset = btf.add_string("int".to_string());
+    let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
     let int_type_id = btf.add_type(int_type);
 
-    let a_name = btf.add_string("a".to_string());
-    let b_name = btf.add_string("b".to_string());
+    let a_name = btf.add_string("a");
+    let b_name = btf.add_string("b");
     let params = vec![
         BtfParam {
             name_offset: a_name,
@@ -804,7 +837,7 @@ pub(crate) fn is_btf_func_global_supported() -> bool {
     let func_proto = BtfType::FuncProto(FuncProto::new(params, int_type_id));
     let func_proto_type_id = btf.add_type(func_proto);
 
-    let add = btf.add_string("inc".to_string());
+    let add = btf.add_string("inc");
     let func = BtfType::Func(Func::new(add, func_proto_type_id, FuncLinkage::Global));
     btf.add_type(func);
 
@@ -827,15 +860,15 @@ pub(crate) fn is_btf_func_global_supported() -> bool {
 
 pub(crate) fn is_btf_datasec_supported() -> bool {
     let mut btf = Btf::new();
-    let name_offset = btf.add_string("int".to_string());
+    let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
     let int_type_id = btf.add_type(int_type);
 
-    let name_offset = btf.add_string("foo".to_string());
+    let name_offset = btf.add_string("foo");
     let var_type = BtfType::Var(Var::new(name_offset, int_type_id, VarLinkage::Static));
     let var_type_id = btf.add_type(var_type);
 
-    let name_offset = btf.add_string(".data".to_string());
+    let name_offset = btf.add_string(".data");
     let variables = vec![DataSecEntry {
         btf_type: var_type_id,
         offset: 0,
@@ -863,7 +896,7 @@ pub(crate) fn is_btf_datasec_supported() -> bool {
 
 pub(crate) fn is_btf_float_supported() -> bool {
     let mut btf = Btf::new();
-    let name_offset = btf.add_string("float".to_string());
+    let name_offset = btf.add_string("float");
     let float_type = BtfType::Float(Float::new(name_offset, 16));
     btf.add_type(float_type);
 
@@ -886,15 +919,15 @@ pub(crate) fn is_btf_float_supported() -> bool {
 
 pub(crate) fn is_btf_decl_tag_supported() -> bool {
     let mut btf = Btf::new();
-    let name_offset = btf.add_string("int".to_string());
+    let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
     let int_type_id = btf.add_type(int_type);
 
-    let name_offset = btf.add_string("foo".to_string());
+    let name_offset = btf.add_string("foo");
     let var_type = BtfType::Var(Var::new(name_offset, int_type_id, VarLinkage::Static));
     let var_type_id = btf.add_type(var_type);
 
-    let name_offset = btf.add_string("decl_tag".to_string());
+    let name_offset = btf.add_string("decl_tag");
     let decl_tag = BtfType::DeclTag(DeclTag::new(name_offset, var_type_id, -1));
     btf.add_type(decl_tag);
 
@@ -921,7 +954,7 @@ pub(crate) fn is_btf_type_tag_supported() -> bool {
     let int_type = BtfType::Int(Int::new(0, 4, IntEncoding::Signed, 0));
     let int_type_id = btf.add_type(int_type);
 
-    let name_offset = btf.add_string("int".to_string());
+    let name_offset = btf.add_string("int");
     let type_tag = BtfType::TypeTag(TypeTag::new(name_offset, int_type_id));
     let type_tag_type = btf.add_type(type_tag);
 
@@ -959,37 +992,36 @@ pub(crate) fn bpf_prog_get_next_id(id: u32) -> Result<Option<u32>, (c_long, io::
     }
 }
 
-pub(crate) fn retry_with_verifier_logs<F>(
+pub(crate) fn retry_with_verifier_logs(
     max_retries: usize,
-    log: &mut VerifierLog,
-    f: F,
-) -> SysResult
-where
-    F: Fn(&mut VerifierLog) -> SysResult,
-{
-    // 1. Try the syscall
-    let ret = f(log);
-    if ret.is_ok() {
-        return ret;
-    }
+    f: impl Fn(&mut [u8]) -> SysResult,
+) -> (SysResult, String) {
+    const MIN_LOG_BUF_SIZE: usize = 1024 * 10;
+    const MAX_LOG_BUF_SIZE: usize = (std::u32::MAX >> 8) as usize;
 
-    // 2. Grow the log buffer so we can capture verifier output
-    //    Retry this up to max_retries times
-    log.grow();
+    let mut log_buf = Vec::new();
     let mut retries = 0;
-
     loop {
-        let ret = f(log);
-        match ret {
-            Err((v, io_error)) if retries == 0 || io_error.raw_os_error() == Some(ENOSPC) => {
-                if retries == max_retries {
-                    return Err((v, io_error));
+        let ret = f(log_buf.as_mut_slice());
+        if retries != max_retries {
+            if let Err((_, io_error)) = &ret {
+                if retries == 0 || io_error.raw_os_error() == Some(ENOSPC) {
+                    let len = (log_buf.capacity() * 10).clamp(MIN_LOG_BUF_SIZE, MAX_LOG_BUF_SIZE);
+                    log_buf.resize(len, 0);
+                    if let Some(first) = log_buf.first_mut() {
+                        *first = 0;
+                    }
+                    retries += 1;
+                    continue;
                 }
-                retries += 1;
-                log.grow();
             }
-            r => return r,
         }
+        if let Some(pos) = log_buf.iter().position(|b| *b == 0) {
+            log_buf.truncate(pos);
+        }
+        let log_buf = String::from_utf8(log_buf).unwrap();
+
+        break (ret, log_buf);
     }
 }
 

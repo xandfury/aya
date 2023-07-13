@@ -1,4 +1,4 @@
-use std::os::unix::prelude::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 
 use crate::{
     generated::{bpf_attach_type::BPF_SK_LOOKUP, bpf_prog_type::BPF_PROG_TYPE_SK_LOOKUP},
@@ -66,7 +66,7 @@ impl SkLookup {
 
         let link_fd = bpf_link_create(prog_fd, netns_fd, BPF_SK_LOOKUP, None, 0).map_err(
             |(_, io_error)| ProgramError::SyscallError {
-                call: "bpf_link_create".to_owned(),
+                call: "bpf_link_create",
                 io_error,
             },
         )? as RawFd;

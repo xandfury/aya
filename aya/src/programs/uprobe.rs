@@ -14,13 +14,15 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    generated::bpf_prog_type::BPF_PROG_TYPE_KPROBE,
+    generated::{bpf_link_type, bpf_prog_type::BPF_PROG_TYPE_KPROBE},
     programs::{
         define_link_wrapper, load_program,
         perf_attach::{PerfLinkIdInner, PerfLinkInner},
         probe::{attach, ProbeKind},
-        ProgramData, ProgramError,
+        FdLink, LinkError, ProgramData, ProgramError,
     },
+    sys::bpf_link_get_info_by_fd,
+    VerifierLogLevel,
 };
 
 const LD_SO_CACHE_FILE: &str = "/etc/ld.so.cache";
@@ -145,7 +147,7 @@ impl UProbe {
     /// On drop, any managed links are detached and the program is unloaded. This will not result in
     /// the program being unloaded from the kernel if it is still pinned.
     pub fn from_pin<P: AsRef<Path>>(path: P, kind: ProbeKind) -> Result<Self, ProgramError> {
-        let data = ProgramData::from_pinned_path(path)?;
+        let data = ProgramData::from_pinned_path(path, VerifierLogLevel::default())?;
         Ok(Self { data, kind })
     }
 }
@@ -158,6 +160,35 @@ define_link_wrapper!(
     PerfLinkInner,
     PerfLinkIdInner
 );
+
+impl TryFrom<UProbeLink> for FdLink {
+    type Error = LinkError;
+
+    fn try_from(value: UProbeLink) -> Result<Self, Self::Error> {
+        if let PerfLinkInner::FdLink(fd) = value.into_inner() {
+            Ok(fd)
+        } else {
+            Err(LinkError::InvalidLink)
+        }
+    }
+}
+
+impl TryFrom<FdLink> for UProbeLink {
+    type Error = LinkError;
+
+    fn try_from(fd_link: FdLink) -> Result<Self, Self::Error> {
+        let info =
+            bpf_link_get_info_by_fd(fd_link.fd).map_err(|io_error| LinkError::SyscallError {
+                call: "BPF_OBJ_GET_INFO_BY_FD",
+                code: 0,
+                io_error,
+            })?;
+        if info.type_ == (bpf_link_type::BPF_LINK_TYPE_TRACING as u32) {
+            return Ok(UProbeLink::new(PerfLinkInner::FdLink(fd_link)));
+        }
+        Err(LinkError::InvalidLink)
+    }
+}
 
 /// The type returned when attaching an [`UProbe`] fails.
 #[derive(Debug, Error)]

@@ -64,6 +64,7 @@ pub mod uprobe;
 mod utils;
 pub mod xdp;
 
+use crate::util::KernelVersion;
 use libc::ENOSPC;
 use std::{
     ffi::CString,
@@ -105,14 +106,14 @@ pub use xdp::{Xdp, XdpError, XdpFlags};
 use crate::{
     generated::{bpf_attach_type, bpf_prog_info, bpf_prog_type},
     maps::MapError,
-    obj::{self, btf::BtfError, Function, KernelVersion},
+    obj::{self, btf::BtfError, Function},
     pin::PinError,
     sys::{
         bpf_btf_get_fd_by_id, bpf_get_object, bpf_load_program, bpf_pin_object,
         bpf_prog_get_fd_by_id, bpf_prog_get_info_by_fd, bpf_prog_get_next_id, bpf_prog_query,
         retry_with_verifier_logs, BpfLoadProgramAttrs,
     },
-    util::VerifierLog,
+    VerifierLogLevel,
 };
 
 /// Error type returned when working with programs.
@@ -148,7 +149,7 @@ pub enum ProgramError {
     #[error("`{call}` failed")]
     SyscallError {
         /// The name of the syscall which failed.
-        call: String,
+        call: &'static str,
         /// The [`io::Error`] returned by the syscall.
         #[source]
         io_error: io::Error,
@@ -413,7 +414,7 @@ pub(crate) struct ProgramData<T: Link> {
     pub(crate) attach_btf_id: Option<u32>,
     pub(crate) attach_prog_fd: Option<RawFd>,
     pub(crate) btf_fd: Option<RawFd>,
-    pub(crate) verifier_log_level: u32,
+    pub(crate) verifier_log_level: VerifierLogLevel,
     pub(crate) path: Option<PathBuf>,
     pub(crate) flags: u32,
 }
@@ -423,7 +424,7 @@ impl<T: Link> ProgramData<T> {
         name: Option<String>,
         obj: (obj::Program, obj::Function),
         btf_fd: Option<RawFd>,
-        verifier_log_level: u32,
+        verifier_log_level: VerifierLogLevel,
     ) -> ProgramData<T> {
         ProgramData {
             name,
@@ -446,6 +447,7 @@ impl<T: Link> ProgramData<T> {
         fd: RawFd,
         path: &Path,
         info: bpf_prog_info,
+        verifier_log_level: VerifierLogLevel,
     ) -> Result<ProgramData<T>, ProgramError> {
         let attach_btf_id = if info.attach_btf_id > 0 {
             Some(info.attach_btf_id)
@@ -455,7 +457,7 @@ impl<T: Link> ProgramData<T> {
         let attach_btf_obj_fd = if info.attach_btf_obj_id > 0 {
             let fd = bpf_btf_get_fd_by_id(info.attach_btf_obj_id).map_err(|io_error| {
                 ProgramError::SyscallError {
-                    call: "bpf_btf_get_fd_by_id".to_string(),
+                    call: "bpf_btf_get_fd_by_id",
                     io_error,
                 }
             })?;
@@ -474,7 +476,7 @@ impl<T: Link> ProgramData<T> {
             attach_btf_id,
             attach_prog_fd: None,
             btf_fd: None,
-            verifier_log_level: 0,
+            verifier_log_level,
             path: Some(path.to_path_buf()),
             flags: 0,
         })
@@ -482,23 +484,23 @@ impl<T: Link> ProgramData<T> {
 
     pub(crate) fn from_pinned_path<P: AsRef<Path>>(
         path: P,
+        verifier_log_level: VerifierLogLevel,
     ) -> Result<ProgramData<T>, ProgramError> {
         let path_string =
             CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes()).unwrap();
         let fd =
             bpf_get_object(&path_string).map_err(|(_, io_error)| ProgramError::SyscallError {
-                call: "bpf_obj_get".to_owned(),
+                call: "bpf_obj_get",
                 io_error,
             })? as RawFd;
 
         let info = bpf_prog_get_info_by_fd(fd).map_err(|io_error| ProgramError::SyscallError {
-            call: "bpf_prog_get_info_by_fd".to_owned(),
+            call: "bpf_prog_get_info_by_fd",
             io_error,
         })?;
 
-        let info = ProgramInfo(info);
-        let name = info.name_as_str().map(|s| s.to_string());
-        ProgramData::from_bpf_prog_info(name, fd, path.as_ref(), info.0)
+        let name = ProgramInfo(info).name_as_str().map(|s| s.to_string());
+        ProgramData::from_bpf_prog_info(name, fd, path.as_ref(), info, verifier_log_level)
     }
 }
 
@@ -528,8 +530,8 @@ fn pin_program<T: Link, P: AsRef<Path>>(
     let fd = data.fd.ok_or(PinError::NoFd {
         name: data
             .name
-            .as_ref()
-            .unwrap_or(&"<unknown program>".to_string())
+            .as_deref()
+            .unwrap_or("<unknown program>")
             .to_string(),
     })?;
     let path_string = CString::new(path.as_ref().to_string_lossy().into_owned()).map_err(|e| {
@@ -538,7 +540,7 @@ fn pin_program<T: Link, P: AsRef<Path>>(
         }
     })?;
     bpf_pin_object(fd, &path_string).map_err(|(_, io_error)| PinError::SyscallError {
-        name: "BPF_OBJ_PIN".to_string(),
+        name: "BPF_OBJ_PIN",
         io_error,
     })?;
     Ok(())
@@ -548,7 +550,20 @@ fn load_program<T: Link>(
     prog_type: bpf_prog_type,
     data: &mut ProgramData<T>,
 ) -> Result<(), ProgramError> {
-    let ProgramData { obj, fd, .. } = data;
+    let ProgramData {
+        name,
+        obj,
+        fd,
+        links: _,
+        expected_attach_type,
+        attach_btf_obj_fd,
+        attach_btf_id,
+        attach_prog_fd,
+        btf_fd,
+        verifier_log_level,
+        path: _,
+        flags,
+    } = data;
     if fd.is_some() {
         return Err(ProgramError::AlreadyLoaded);
     }
@@ -573,17 +588,16 @@ fn load_program<T: Link>(
         },
     ) = obj;
 
-    let target_kernel_version = match *kernel_version {
-        KernelVersion::Any => {
-            let (major, minor, patch) = crate::sys::kernel_version().unwrap();
-            (major << 16) + (minor << 8) + patch
-        }
-        _ => (*kernel_version).into(),
-    };
+    let target_kernel_version = kernel_version.unwrap_or_else(|| {
+        let KernelVersion {
+            major,
+            minor,
+            patch,
+        } = KernelVersion::current().unwrap();
+        (u32::from(major) << 16) + (u32::from(minor) << 8) + u32::from(patch)
+    });
 
-    let mut logger = VerifierLog::new();
-
-    let prog_name = if let Some(name) = &data.name {
+    let prog_name = if let Some(name) = name {
         let mut name = name.clone();
         if name.len() > 15 {
             name.truncate(15);
@@ -601,21 +615,20 @@ fn load_program<T: Link>(
         insns: instructions,
         license,
         kernel_version: target_kernel_version,
-        expected_attach_type: data.expected_attach_type,
-        prog_btf_fd: data.btf_fd,
-        attach_btf_obj_fd: data.attach_btf_obj_fd,
-        attach_btf_id: data.attach_btf_id,
-        attach_prog_fd: data.attach_prog_fd,
+        expected_attach_type: *expected_attach_type,
+        prog_btf_fd: *btf_fd,
+        attach_btf_obj_fd: *attach_btf_obj_fd,
+        attach_btf_id: *attach_btf_id,
+        attach_prog_fd: *attach_prog_fd,
         func_info_rec_size: *func_info_rec_size,
         func_info: func_info.clone(),
         line_info_rec_size: *line_info_rec_size,
         line_info: line_info.clone(),
-        flags: data.flags,
+        flags: *flags,
     };
 
-    let verifier_log_level = data.verifier_log_level;
-    let ret = retry_with_verifier_logs(10, &mut logger, |logger| {
-        bpf_load_program(&attr, logger, verifier_log_level)
+    let (ret, verifier_log) = retry_with_verifier_logs(10, |logger| {
+        bpf_load_program(&attr, logger, *verifier_log_level)
     });
 
     match ret {
@@ -623,16 +636,10 @@ fn load_program<T: Link>(
             *fd = Some(prog_fd as RawFd);
             Ok(())
         }
-        Err((_, io_error)) => {
-            logger.truncate();
-            return Err(ProgramError::LoadError {
-                io_error,
-                verifier_log: logger
-                    .as_c_str()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "[none]".to_owned()),
-            });
-        }
+        Err((_, io_error)) => Err(ProgramError::LoadError {
+            io_error,
+            verifier_log,
+        }),
     }
 }
 
@@ -666,7 +673,7 @@ pub(crate) fn query<T: AsRawFd>(
             }
             Err((_, io_error)) => {
                 return Err(ProgramError::SyscallError {
-                    call: "bpf_prog_query".to_owned(),
+                    call: "bpf_prog_query",
                     io_error,
                 });
             }
@@ -829,7 +836,7 @@ macro_rules! impl_from_pin {
                 /// On drop, any managed links are detached and the program is unloaded. This will not result in
                 /// the program being unloaded from the kernel if it is still pinned.
                 pub fn from_pin<P: AsRef<Path>>(path: P) -> Result<Self, ProgramError> {
-                    let data = ProgramData::from_pinned_path(path)?;
+                    let data = ProgramData::from_pinned_path(path, VerifierLogLevel::default())?;
                     Ok(Self { data })
                 }
             }
@@ -948,7 +955,7 @@ impl ProgramInfo {
     pub fn fd(&self) -> Result<RawFd, ProgramError> {
         let fd =
             bpf_prog_get_fd_by_id(self.0.id).map_err(|io_error| ProgramError::SyscallError {
-                call: "bpf_prog_get_fd_by_id".to_owned(),
+                call: "bpf_prog_get_fd_by_id",
                 io_error,
             })?;
         Ok(fd as RawFd)
@@ -959,12 +966,12 @@ impl ProgramInfo {
         let path_string = CString::new(path.as_ref().to_str().unwrap()).unwrap();
         let fd =
             bpf_get_object(&path_string).map_err(|(_, io_error)| ProgramError::SyscallError {
-                call: "BPF_OBJ_GET".to_owned(),
+                call: "BPF_OBJ_GET",
                 io_error,
             })? as RawFd;
 
         let info = bpf_prog_get_info_by_fd(fd).map_err(|io_error| ProgramError::SyscallError {
-            call: "bpf_prog_get_info_by_fd".to_owned(),
+            call: "bpf_prog_get_info_by_fd",
             io_error,
         })?;
         unsafe {
@@ -995,16 +1002,18 @@ impl Iterator for ProgramsIter {
                 Some(
                     bpf_prog_get_fd_by_id(next)
                         .map_err(|io_error| ProgramError::SyscallError {
-                            call: "bpf_prog_get_fd_by_id".to_owned(),
+                            call: "bpf_prog_get_fd_by_id",
                             io_error,
                         })
                         .and_then(|fd| {
-                            bpf_prog_get_info_by_fd(fd)
+                            let info = bpf_prog_get_info_by_fd(fd)
                                 .map_err(|io_error| ProgramError::SyscallError {
-                                    call: "bpf_prog_get_info_by_fd".to_owned(),
+                                    call: "bpf_prog_get_info_by_fd",
                                     io_error,
                                 })
-                                .map(ProgramInfo)
+                                .map(ProgramInfo);
+                            unsafe { libc::close(fd) };
+                            info
                         }),
                 )
             }
@@ -1014,7 +1023,7 @@ impl Iterator for ProgramsIter {
                 // iteration to avoid an infinite loop.
                 self.error = true;
                 Some(Err(ProgramError::SyscallError {
-                    call: "bpf_prog_get_fd_by_id".to_owned(),
+                    call: "bpf_prog_get_fd_by_id",
                     io_error,
                 }))
             }

@@ -42,11 +42,12 @@ use std::{
     marker::PhantomData,
     mem,
     ops::Deref,
-    os::unix::{io::RawFd, prelude::AsRawFd},
+    os::fd::{AsRawFd, RawFd},
     path::Path,
     ptr,
 };
 
+use crate::util::KernelVersion;
 use libc::{getrlimit, rlimit, RLIMIT_MEMLOCK, RLIM_INFINITY};
 use log::warn;
 use thiserror::Error;
@@ -56,7 +57,7 @@ use crate::{
     pin::PinError,
     sys::{
         bpf_create_map, bpf_get_object, bpf_map_get_info_by_fd, bpf_map_get_next_key,
-        bpf_pin_object, kernel_version,
+        bpf_pin_object,
     },
     util::nr_cpus,
     PinningType, Pod,
@@ -168,7 +169,7 @@ pub enum MapError {
     #[error("the `{call}` syscall failed")]
     SyscallError {
         /// Syscall Name
-        call: String,
+        call: &'static str,
         /// Original io::Error
         io_error: io::Error,
     },
@@ -181,6 +182,13 @@ pub enum MapError {
         /// The reason for the failure
         #[source]
         error: PinError,
+    },
+
+    /// Unsupported Map type
+    #[error("Unsupported map type found {map_type}")]
+    Unsupported {
+        /// The map type
+        map_type: u32,
     },
 }
 
@@ -261,6 +269,8 @@ pub enum Map {
     StackTraceMap(MapData),
     /// A [`Queue`] map
     Queue(MapData),
+    /// An unsupported map type
+    Unsupported(MapData),
 }
 
 impl Map {
@@ -282,6 +292,7 @@ impl Map {
             Map::Stack(map) => map.obj.map_type(),
             Map::StackTraceMap(map) => map.obj.map_type(),
             Map::Queue(map) => map.obj.map_type(),
+            Map::Unsupported(map) => map.obj.map_type(),
         }
     }
 }
@@ -489,18 +500,23 @@ impl MapData {
 
         let c_name = CString::new(name).map_err(|_| MapError::InvalidName { name: name.into() })?;
 
-        let fd = bpf_create_map(&c_name, &self.obj, self.btf_fd).map_err(|(code, io_error)| {
-            let k_ver = kernel_version().unwrap();
-            if k_ver < (5, 11, 0) {
-                maybe_warn_rlimit();
-            }
+        #[cfg(not(test))]
+        let kernel_version = KernelVersion::current().unwrap();
+        #[cfg(test)]
+        let kernel_version = KernelVersion::new(0xff, 0xff, 0xff);
+        let fd = bpf_create_map(&c_name, &self.obj, self.btf_fd, kernel_version).map_err(
+            |(code, io_error)| {
+                if kernel_version < KernelVersion::new(5, 11, 0) {
+                    maybe_warn_rlimit();
+                }
 
-            MapError::CreateError {
-                name: name.into(),
-                code,
-                io_error,
-            }
-        })? as RawFd;
+                MapError::CreateError {
+                    name: name.into(),
+                    code,
+                    io_error,
+                }
+            },
+        )? as RawFd;
 
         self.fd = Some(fd);
 
@@ -518,7 +534,7 @@ impl MapData {
         let map_path = path.as_ref().join(name);
         let path_string = CString::new(map_path.to_str().unwrap()).unwrap();
         let fd = bpf_get_object(&path_string).map_err(|(_, io_error)| MapError::SyscallError {
-            call: "BPF_OBJ_GET".to_string(),
+            call: "BPF_OBJ_GET",
             io_error,
         })? as RawFd;
 
@@ -540,12 +556,12 @@ impl MapData {
             })?;
 
         let fd = bpf_get_object(&path_string).map_err(|(_, io_error)| MapError::SyscallError {
-            call: "BPF_OBJ_GET".to_owned(),
+            call: "BPF_OBJ_GET",
             io_error,
         })? as RawFd;
 
         let info = bpf_map_get_info_by_fd(fd).map_err(|io_error| MapError::SyscallError {
-            call: "BPF_MAP_GET_INFO_BY_FD".to_owned(),
+            call: "BPF_MAP_GET_INFO_BY_FD",
             io_error,
         })?;
 
@@ -564,7 +580,7 @@ impl MapData {
     /// For example, you received an FD over Unix Domain Socket.
     pub fn from_fd(fd: RawFd) -> Result<MapData, MapError> {
         let info = bpf_map_get_info_by_fd(fd).map_err(|io_error| MapError::SyscallError {
-            call: "BPF_OBJ_GET".to_owned(),
+            call: "BPF_OBJ_GET",
             io_error,
         })?;
 
@@ -594,7 +610,7 @@ impl MapData {
             }
         })?;
         bpf_pin_object(fd, &path_string).map_err(|(_, io_error)| PinError::SyscallError {
-            name: "BPF_OBJ_PIN".to_string(),
+            name: "BPF_OBJ_PIN",
             io_error,
         })?;
         self.pinned = true;
@@ -683,7 +699,7 @@ impl<K: Pod> Iterator for MapKeys<'_, K> {
             Err((_, io_error)) => {
                 self.err = true;
                 Some(Err(MapError::SyscallError {
-                    call: "bpf_map_get_next_key".to_owned(),
+                    call: "bpf_map_get_next_key",
                     io_error,
                 }))
             }
@@ -827,6 +843,7 @@ impl<T: Pod> Deref for PerCpuValues<T> {
 #[cfg(test)]
 mod tests {
     use libc::EFAULT;
+    use matches::assert_matches;
 
     use crate::{
         bpf_map_def,
@@ -874,12 +891,9 @@ mod tests {
         });
 
         let mut map = new_map();
-        assert!(matches!(map.create("foo"), Ok(42)));
+        assert_matches!(map.create("foo"), Ok(42));
         assert_eq!(map.fd, Some(42));
-        assert!(matches!(
-            map.create("foo"),
-            Err(MapError::AlreadyCreated { .. })
-        ));
+        assert_matches!(map.create("foo"), Err(MapError::AlreadyCreated { .. }));
     }
 
     #[test]
@@ -888,7 +902,7 @@ mod tests {
 
         let mut map = new_map();
         let ret = map.create("foo");
-        assert!(matches!(ret, Err(MapError::CreateError { .. })));
+        assert_matches!(ret, Err(MapError::CreateError { .. }));
         if let Err(MapError::CreateError {
             name,
             code,

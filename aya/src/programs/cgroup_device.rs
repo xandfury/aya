@@ -1,12 +1,14 @@
 //! Cgroup device programs.
-use std::os::unix::prelude::{AsRawFd, RawFd};
+
+use crate::util::KernelVersion;
+use std::os::fd::{AsRawFd, RawFd};
 
 use crate::{
     generated::{bpf_attach_type::BPF_CGROUP_DEVICE, bpf_prog_type::BPF_PROG_TYPE_CGROUP_DEVICE},
     programs::{
         define_link_wrapper, load_program, FdLink, Link, ProgAttachLink, ProgramData, ProgramError,
     },
-    sys::{bpf_link_create, bpf_prog_attach, kernel_version},
+    sys::{bpf_link_create, bpf_prog_attach},
 };
 
 /// A program used to watch or prevent device interaction from a cgroup.
@@ -62,11 +64,10 @@ impl CgroupDevice {
         let prog_fd = self.data.fd_or_err()?;
         let cgroup_fd = cgroup.as_raw_fd();
 
-        let k_ver = kernel_version().unwrap();
-        if k_ver >= (5, 7, 0) {
+        if KernelVersion::current().unwrap() >= KernelVersion::new(5, 7, 0) {
             let link_fd = bpf_link_create(prog_fd, cgroup_fd, BPF_CGROUP_DEVICE, None, 0).map_err(
                 |(_, io_error)| ProgramError::SyscallError {
-                    call: "bpf_link_create".to_owned(),
+                    call: "bpf_link_create",
                     io_error,
                 },
             )? as RawFd;
@@ -78,7 +79,7 @@ impl CgroupDevice {
         } else {
             bpf_prog_attach(prog_fd, cgroup_fd, BPF_CGROUP_DEVICE).map_err(|(_, io_error)| {
                 ProgramError::SyscallError {
-                    call: "bpf_prog_attach".to_owned(),
+                    call: "bpf_prog_attach",
                     io_error,
                 }
             })?;

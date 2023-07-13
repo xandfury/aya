@@ -1,15 +1,16 @@
-use anyhow::{Context, Result};
-use std::{path::PathBuf, process::Command, thread::sleep, time::Duration};
-use tempfile::TempDir;
+use anyhow::{anyhow, bail, Context as _, Result};
+use std::{
+    process::{Child, ChildStdout, Command, Stdio},
+    thread::sleep,
+    time::Duration,
+};
 
-use aya::{maps::Array, programs::TracePoint, BpfLoader, Btf, Endianness};
-
-use super::integration_test;
+use aya::{maps::Array, programs::TracePoint, util::KernelVersion, BpfLoader, Btf, Endianness};
 
 // In the tests below we often use values like 0xAAAAAAAA or -0x7AAAAAAA. Those values have no
 // special meaning, they just have "nice" bit patterns that can be helpful while debugging.
 
-#[integration_test]
+#[test]
 fn relocate_field() {
     let test = RelocationTest {
         local_definition: r#"
@@ -40,7 +41,7 @@ fn relocate_field() {
     assert_eq!(test.run_no_btf().unwrap(), 3);
 }
 
-#[integration_test]
+#[test]
 fn relocate_enum() {
     let test = RelocationTest {
         local_definition: r#"
@@ -60,8 +61,13 @@ fn relocate_enum() {
     assert_eq!(test.run_no_btf().unwrap(), 0xAAAAAAAA);
 }
 
-#[integration_test]
+#[test]
 fn relocate_enum_signed() {
+    let kernel_version = KernelVersion::current().unwrap();
+    if kernel_version < KernelVersion::new(6, 0, 0) {
+        eprintln!("skipping test on kernel {kernel_version:?}, support for signed enum was added in 6.0.0; see https://github.com/torvalds/linux/commit/6089fb3");
+        return;
+    }
     let test = RelocationTest {
         local_definition: r#"
             enum foo { D = -0x7AAAAAAA };
@@ -80,8 +86,13 @@ fn relocate_enum_signed() {
     assert_eq!(test.run_no_btf().unwrap() as i64, -0x7AAAAAAAi64);
 }
 
-#[integration_test]
+#[test]
 fn relocate_enum64() {
+    let kernel_version = KernelVersion::current().unwrap();
+    if kernel_version < KernelVersion::new(6, 0, 0) {
+        eprintln!("skipping test on kernel {kernel_version:?}, support for enum64 was added in 6.0.0; see https://github.com/torvalds/linux/commit/6089fb3");
+        return;
+    }
     let test = RelocationTest {
         local_definition: r#"
             enum foo { D = 0xAAAAAAAABBBBBBBB };
@@ -100,8 +111,13 @@ fn relocate_enum64() {
     assert_eq!(test.run_no_btf().unwrap(), 0xAAAAAAAABBBBBBBB);
 }
 
-#[integration_test]
+#[test]
 fn relocate_enum64_signed() {
+    let kernel_version = KernelVersion::current().unwrap();
+    if kernel_version < KernelVersion::new(6, 0, 0) {
+        eprintln!("skipping test on kernel {kernel_version:?}, support for enum64 was added in 6.0.0; see https://github.com/torvalds/linux/commit/6089fb3");
+        return;
+    }
     let test = RelocationTest {
         local_definition: r#"
             enum foo { D = -0xAAAAAAABBBBBBBB };
@@ -120,7 +136,7 @@ fn relocate_enum64_signed() {
     assert_eq!(test.run_no_btf().unwrap() as i64, -0xAAAAAAABBBBBBBBi64);
 }
 
-#[integration_test]
+#[test]
 fn relocate_pointer() {
     let test = RelocationTest {
         local_definition: r#"
@@ -143,7 +159,7 @@ fn relocate_pointer() {
     assert_eq!(test.run_no_btf().unwrap(), 42);
 }
 
-#[integration_test]
+#[test]
 fn relocate_struct_flavors() {
     let definition = r#"
         struct foo {};
@@ -202,9 +218,15 @@ impl RelocationTest {
     /// - Generate the source eBPF filling a template
     /// - Compile it with clang
     fn build_ebpf(&self) -> Result<Vec<u8>> {
-        let local_definition = self.local_definition;
-        let relocation_code = self.relocation_code;
-        let (_tmp_dir, compiled_file) = compile(&format!(
+        use std::io::Read as _;
+
+        let Self {
+            local_definition,
+            relocation_code,
+            ..
+        } = self;
+
+        let mut stdout = compile(&format!(
             r#"
                 #include <linux/bpf.h>
 
@@ -237,23 +259,29 @@ impl RelocationTest {
                 char _license[] __attribute__((section("license"), used)) = "GPL";
             "#
         ))
-        .context("Failed to compile eBPF program")?;
-        let bytecode =
-            std::fs::read(compiled_file).context("Error reading compiled eBPF program")?;
-        Ok(bytecode)
+        .context("failed to compile eBPF program")?;
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output)?;
+        Ok(output)
     }
 
     /// - Generate the target BTF source with a mock main()
     /// - Compile it with clang
     /// - Extract the BTF with llvm-objcopy
     fn build_btf(&self) -> Result<Btf> {
-        let target_btf = self.target_btf;
-        let relocation_code = self.relocation_code;
+        use std::io::Read as _;
+
+        let Self {
+            target_btf,
+            relocation_code,
+            ..
+        } = self;
+
         // BTF files can be generated and inspected with these commands:
         // $ clang -c -g -O2 -target bpf target.c
         // $ pahole --btf_encode_detached=target.btf -V target.o
         // $ bpftool btf dump file ./target.btf  format c
-        let (tmp_dir, compiled_file) = compile(&format!(
+        let stdout = compile(&format!(
             r#"
                 #include <linux/bpf.h>
 
@@ -267,38 +295,68 @@ impl RelocationTest {
                 }}
             "#
         ))
-        .context("Failed to compile BTF")?;
-        Command::new("llvm-objcopy")
-            .current_dir(tmp_dir.path())
-            .args(["--dump-section", ".BTF=target.btf"])
-            .arg(compiled_file)
-            .status()
-            .context("Failed to run llvm-objcopy")?
-            .success()
-            .then_some(())
-            .context("Failed to extract BTF")?;
-        let btf = Btf::parse_file(tmp_dir.path().join("target.btf"), Endianness::default())
-            .context("Error parsing generated BTF")?;
-        Ok(btf)
+        .context("failed to compile BTF")?;
+
+        let mut cmd = Command::new("llvm-objcopy");
+        cmd.args(["--dump-section", ".BTF=-", "-"])
+            .stdin(stdout)
+            .stdout(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn {cmd:?}"))?;
+        let Child { stdout, .. } = &mut child;
+        let mut stdout = stdout.take().ok_or(anyhow!("failed to open stdout"))?;
+        let status = child
+            .wait()
+            .with_context(|| format!("failed to wait for {cmd:?}"))?;
+        match status.code() {
+            Some(code) => match code {
+                0 => {}
+                code => bail!("{cmd:?} exited with code {code}"),
+            },
+            None => bail!("{cmd:?} terminated by signal"),
+        }
+
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output)?;
+
+        Btf::parse(output.as_slice(), Endianness::default())
+            .context("failed to parse generated BTF")
     }
 }
 
-/// Compile an eBPF program and return the path of the compiled object.
-/// Also returns a TempDir handler, dropping it will clear the created dicretory.
-fn compile(source_code: &str) -> Result<(TempDir, PathBuf)> {
-    let tmp_dir = tempfile::tempdir().context("Error making temp dir")?;
-    let source = tmp_dir.path().join("source.c");
-    std::fs::write(&source, source_code).context("Writing bpf program failed")?;
-    Command::new("clang")
-        .current_dir(&tmp_dir)
-        .args(["-c", "-g", "-O2", "-target", "bpf"])
-        .arg(&source)
-        .status()
-        .context("Failed to run clang")?
-        .success()
-        .then_some(())
-        .context("Failed to compile eBPF source")?;
-    Ok((tmp_dir, source.with_extension("o")))
+/// Compile an eBPF program and return its bytes.
+fn compile(source_code: &str) -> Result<ChildStdout> {
+    use std::io::Write as _;
+
+    let mut cmd = Command::new("clang");
+    cmd.args([
+        "-c", "-g", "-O2", "-target", "bpf", "-x", "c", "-", "-o", "-",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {cmd:?}"))?;
+    let Child { stdin, stdout, .. } = &mut child;
+    {
+        let mut stdin = stdin.take().ok_or(anyhow!("failed to open stdin"))?;
+        stdin
+            .write_all(source_code.as_bytes())
+            .context("failed to write to stdin")?;
+    }
+    let stdout = stdout.take().ok_or(anyhow!("failed to open stdout"))?;
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for {cmd:?}"))?;
+    match status.code() {
+        Some(code) => match code {
+            0 => {}
+            code => bail!("{cmd:?} exited with code {code}"),
+        },
+        None => bail!("{cmd:?} terminated by signal"),
+    }
+    Ok(stdout)
 }
 
 struct RelocationTestRunner {

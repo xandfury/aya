@@ -1,5 +1,5 @@
 //! Lirc programs.
-use std::os::unix::prelude::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 
 use crate::{
     generated::{bpf_attach_type::BPF_LIRC_MODE2, bpf_prog_type::BPF_PROG_TYPE_LIRC_MODE2},
@@ -66,7 +66,7 @@ impl LircMode2 {
 
         bpf_prog_attach(prog_fd, lircdev_fd, BPF_LIRC_MODE2).map_err(|(_, io_error)| {
             ProgramError::SyscallError {
-                call: "bpf_prog_attach".to_owned(),
+                call: "bpf_prog_attach",
                 io_error,
             }
         })?;
@@ -97,7 +97,7 @@ impl LircMode2 {
 
         for id in prog_ids {
             let fd = bpf_prog_get_fd_by_id(id).map_err(|io_error| ProgramError::SyscallError {
-                call: "bpf_prog_get_fd_by_id".to_owned(),
+                call: "bpf_prog_get_fd_by_id",
                 io_error,
             })?;
 
@@ -135,7 +135,7 @@ impl LircLink {
         match bpf_prog_get_info_by_fd(self.prog_fd) {
             Ok(info) => Ok(ProgramInfo(info)),
             Err(io_error) => Err(ProgramError::SyscallError {
-                call: "bpf_prog_get_info_by_fd".to_owned(),
+                call: "bpf_prog_get_info_by_fd",
                 io_error,
             }),
         }

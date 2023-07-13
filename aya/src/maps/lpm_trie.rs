@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     maps::{check_kv_size, IterableMap, MapData, MapError, MapIter, MapKeys},
-    sys::{bpf_map_delete_elem, bpf_map_get_next_key, bpf_map_lookup_elem, bpf_map_update_elem},
+    sys::{bpf_map_delete_elem, bpf_map_lookup_elem, bpf_map_update_elem},
     Pod,
 };
 
@@ -26,7 +26,7 @@ use crate::{
 /// let mut trie = LpmTrie::try_from(bpf.map_mut("LPM_TRIE").unwrap())?;
 /// let ipaddr = Ipv4Addr::new(8, 8, 8, 8);
 /// // The following represents a key for the "8.8.8.8/16" subnet.
-/// // The first argument - the prefix length - represents how many bytes should be matched against. The second argument is the actual data to be matched.
+/// // The first argument - the prefix length - represents how many bits should be matched against. The second argument is the actual data to be matched.
 /// let key = Key::new(16, u32::from(ipaddr).to_be());
 /// trie.insert(&key, 1, 0)?;
 ///
@@ -45,13 +45,14 @@ use crate::{
 /// ```
 
 #[doc(alias = "BPF_MAP_TYPE_LPM_TRIE")]
+#[derive(Debug)]
 pub struct LpmTrie<T, K, V> {
     inner: T,
     _k: PhantomData<K>,
     _v: PhantomData<V>,
 }
 
-/// A Key for and LpmTrie map.
+/// A Key for an LpmTrie map.
 ///
 /// # Examples
 ///
@@ -64,14 +65,17 @@ pub struct LpmTrie<T, K, V> {
 /// ```
 #[repr(packed)]
 pub struct Key<K: Pod> {
-    /// Represents the number of bytes matched against.
-    pub prefix_len: u32,
-    /// Represents arbitrary data stored in the LpmTrie.
-    pub data: K,
+    prefix_len: u32,
+    data: K,
 }
 
 impl<K: Pod> Key<K> {
     /// Creates a new key.
+    ///
+    /// `prefix_len` is the number of bits in the data to match against.
+    /// `data` is the data in the key which is typically an IPv4 or IPv6 address.
+    /// If using a key to perform a longest prefix match on you would use a `prefix_len`
+    /// of 32 for IPv4 and 128 for IPv6.
     ///
     /// # Examples
     ///
@@ -84,6 +88,16 @@ impl<K: Pod> Key<K> {
     /// ```
     pub fn new(prefix_len: u32, data: K) -> Self {
         Self { prefix_len, data }
+    }
+
+    /// Returns the number of bits in the data to be matched.
+    pub fn prefix_len(&self) -> u32 {
+        self.prefix_len
+    }
+
+    /// Returns the data stored in the Key.
+    pub fn data(&self) -> K {
+        self.data
     }
 }
 
@@ -117,29 +131,23 @@ impl<T: Borrow<MapData>, K: Pod, V: Pod> LpmTrie<T, K, V> {
         let fd = self.inner.borrow().fd_or_err()?;
         let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(_, io_error)| {
             MapError::SyscallError {
-                call: "bpf_map_lookup_elem".to_owned(),
+                call: "bpf_map_lookup_elem",
                 io_error,
             }
         })?;
         value.ok_or(MapError::KeyNotFound)
     }
 
-    /// An iterator visiting all key-value pairs in arbitrary order. The
+    /// An iterator visiting all key-value pairs. The
     /// iterator item type is `Result<(K, V), MapError>`.
     pub fn iter(&self) -> MapIter<'_, Key<K>, V, Self> {
         MapIter::new(self)
     }
 
-    /// An iterator visiting all keys in arbitrary order. The iterator element
+    /// An iterator visiting all keys. The iterator element
     /// type is `Result<Key<K>, MapError>`.
     pub fn keys(&self) -> MapKeys<'_, Key<K>> {
         MapKeys::new(self.inner.borrow())
-    }
-
-    /// An iterator visiting all keys matching key. The
-    /// iterator item type is `Result<Key<K>, MapError>`.
-    pub fn iter_key(&self, key: Key<K>) -> LpmTrieKeys<'_, K> {
-        LpmTrieKeys::new(self.inner.borrow(), key)
     }
 }
 
@@ -154,7 +162,7 @@ impl<T: BorrowMut<MapData>, K: Pod, V: Pod> LpmTrie<T, K, V> {
         let fd = self.inner.borrow().fd_or_err()?;
         bpf_map_update_elem(fd, Some(key), value.borrow(), flags).map_err(|(_, io_error)| {
             MapError::SyscallError {
-                call: "bpf_map_update_elem".to_owned(),
+                call: "bpf_map_update_elem",
                 io_error,
             }
         })?;
@@ -170,7 +178,7 @@ impl<T: BorrowMut<MapData>, K: Pod, V: Pod> LpmTrie<T, K, V> {
         bpf_map_delete_elem(fd, key)
             .map(|_| ())
             .map_err(|(_, io_error)| MapError::SyscallError {
-                call: "bpf_map_delete_elem".to_owned(),
+                call: "bpf_map_delete_elem",
                 io_error,
             })
     }
@@ -183,56 +191,6 @@ impl<T: Borrow<MapData>, K: Pod, V: Pod> IterableMap<Key<K>, V> for LpmTrie<T, K
 
     fn get(&self, key: &Key<K>) -> Result<V, MapError> {
         self.get(key, 0)
-    }
-}
-
-/// Iterator returned by `LpmTrie::iter_key()`.
-pub struct LpmTrieKeys<'coll, K: Pod> {
-    map: &'coll MapData,
-    err: bool,
-    key: Key<K>,
-}
-
-impl<'coll, K: Pod> LpmTrieKeys<'coll, K> {
-    fn new(map: &'coll MapData, key: Key<K>) -> LpmTrieKeys<'coll, K> {
-        LpmTrieKeys {
-            map,
-            err: false,
-            key,
-        }
-    }
-}
-
-impl<K: Pod> Iterator for LpmTrieKeys<'_, K> {
-    type Item = Result<Key<K>, MapError>;
-
-    fn next(&mut self) -> Option<Result<Key<K>, MapError>> {
-        if self.err {
-            return None;
-        }
-
-        let fd = match self.map.fd_or_err() {
-            Ok(fd) => fd,
-            Err(e) => {
-                self.err = true;
-                return Some(Err(e));
-            }
-        };
-
-        match bpf_map_get_next_key(fd, Some(&self.key)) {
-            Ok(Some(key)) => {
-                self.key = key;
-                Some(Ok(key))
-            }
-            Ok(None) => None,
-            Err((_, io_error)) => {
-                self.err = true;
-                Some(Err(MapError::SyscallError {
-                    call: "bpf_map_get_next_key".to_owned(),
-                    io_error,
-                }))
-            }
-        }
     }
 }
 
@@ -250,6 +208,7 @@ mod tests {
         sys::{override_syscall, SysResult, Syscall},
     };
     use libc::{EFAULT, ENOENT};
+    use matches::assert_matches;
     use std::{io, mem, net::Ipv4Addr};
 
     fn new_obj_map() -> obj::Map {
@@ -280,13 +239,13 @@ mod tests {
             pinned: false,
             btf_fd: None,
         };
-        assert!(matches!(
+        assert_matches!(
             LpmTrie::<_, u16, u32>::new(&map),
             Err(MapError::InvalidKeySize {
                 size: 6,
                 expected: 8 // four bytes for prefixlen and four bytes for data.
             })
-        ));
+        );
     }
 
     #[test]
@@ -297,13 +256,13 @@ mod tests {
             pinned: false,
             btf_fd: None,
         };
-        assert!(matches!(
+        assert_matches!(
             LpmTrie::<_, u32, u16>::new(&map),
             Err(MapError::InvalidValueSize {
                 size: 2,
                 expected: 4
             })
-        ));
+        );
     }
 
     #[test]
@@ -329,10 +288,10 @@ mod tests {
 
         let map = Map::PerfEventArray(map_data);
 
-        assert!(matches!(
+        assert_matches!(
             LpmTrie::<_, u32, u32>::try_from(&map),
             Err(MapError::InvalidMapType { .. })
-        ));
+        );
     }
 
     #[test]
@@ -344,10 +303,10 @@ mod tests {
             btf_fd: None,
         };
 
-        assert!(matches!(
+        assert_matches!(
             LpmTrie::<_, u32, u32>::new(&mut map),
             Err(MapError::NotCreated { .. })
-        ));
+        );
     }
 
     #[test]
@@ -388,10 +347,10 @@ mod tests {
         let mut trie = LpmTrie::<_, u32, u32>::new(&mut map).unwrap();
         let ipaddr = Ipv4Addr::new(8, 8, 8, 8);
         let key = Key::new(16, u32::from(ipaddr).to_be());
-        assert!(matches!(
+        assert_matches!(
             trie.insert(&key, 1, 0),
             Err(MapError::SyscallError { call, io_error }) if call == "bpf_map_update_elem" && io_error.raw_os_error() == Some(EFAULT)
-        ));
+        );
     }
 
     #[test]
@@ -430,10 +389,10 @@ mod tests {
         let mut trie = LpmTrie::<_, u32, u32>::new(&mut map).unwrap();
         let ipaddr = Ipv4Addr::new(8, 8, 8, 8);
         let key = Key::new(16, u32::from(ipaddr).to_be());
-        assert!(matches!(
+        assert_matches!(
             trie.remove(&key),
             Err(MapError::SyscallError { call, io_error }) if call == "bpf_map_delete_elem" && io_error.raw_os_error() == Some(EFAULT)
-        ));
+        );
     }
 
     #[test]
@@ -471,10 +430,10 @@ mod tests {
         let ipaddr = Ipv4Addr::new(8, 8, 8, 8);
         let key = Key::new(16, u32::from(ipaddr).to_be());
 
-        assert!(matches!(
+        assert_matches!(
             trie.get(&key, 0),
             Err(MapError::SyscallError { call, io_error }) if call == "bpf_map_lookup_elem" && io_error.raw_os_error() == Some(EFAULT)
-        ));
+        );
     }
 
     #[test]
@@ -496,6 +455,6 @@ mod tests {
         let ipaddr = Ipv4Addr::new(8, 8, 8, 8);
         let key = Key::new(16, u32::from(ipaddr).to_be());
 
-        assert!(matches!(trie.get(&key, 0), Err(MapError::KeyNotFound)));
+        assert_matches!(trie.get(&key, 0), Err(MapError::KeyNotFound));
     }
 }

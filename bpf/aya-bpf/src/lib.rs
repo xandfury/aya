@@ -4,13 +4,14 @@
 //!
 //! Aya-bpf is an eBPF library built with a focus on operability and developer experience.
 //! It is the kernel-space counterpart of [Aya](https://docs.rs/aya)
-
 #![doc(
     html_logo_url = "https://aya-rs.dev/assets/images/crabby.svg",
     html_favicon_url = "https://aya-rs.dev/assets/images/crabby.svg"
 )]
 #![cfg_attr(unstable, feature(never_type))]
+#![cfg_attr(target_arch = "bpf", feature(asm_experimental_arch))]
 #![allow(clippy::missing_safety_doc)]
+#![warn(clippy::cast_lossless, clippy::cast_sign_loss)]
 #![no_std]
 
 pub use aya_bpf_bindings::bindings;
@@ -58,17 +59,44 @@ pub trait BpfContext {
 
 #[no_mangle]
 pub unsafe extern "C" fn memset(s: *mut u8, c: c_int, n: usize) {
-    let base = s as usize;
+    #[allow(clippy::cast_sign_loss)]
+    let b = c as u8;
     for i in 0..n {
-        *((base + i) as *mut u8) = c as u8;
+        *s.add(i) = b;
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *mut u8, n: usize) {
-    let dest_base = dest as usize;
-    let src_base = src as usize;
     for i in 0..n {
-        *((dest_base + i) as *mut u8) = *((src_base + i) as *mut u8);
+        *dest.add(i) = *src.add(i);
+    }
+}
+
+/// Check if a value is within a range, using conditional forms compatible with
+/// the verifier.
+#[inline(always)]
+pub fn check_bounds_signed(value: i64, lower: i64, upper: i64) -> bool {
+    #[cfg(target_arch = "bpf")]
+    unsafe {
+        let mut in_bounds = 0u64;
+        core::arch::asm!(
+            "if {value} s< {lower} goto +2",
+            "if {value} s> {upper} goto +1",
+            "{i} = 1",
+            i = inout(reg) in_bounds,
+            lower = in(reg) lower,
+            upper = in(reg) upper,
+            value = in(reg) value,
+        );
+        in_bounds == 1
+    }
+    // We only need this for doc tests which are compiled for the host target
+    #[cfg(not(target_arch = "bpf"))]
+    {
+        let _ = value;
+        let _ = lower;
+        let _ = upper;
+        unimplemented!()
     }
 }

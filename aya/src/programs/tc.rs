@@ -17,6 +17,7 @@ use crate::{
         netlink_qdisc_detach,
     },
     util::{ifindex_from_ifname, tc_handler_make},
+    VerifierLogLevel,
 };
 
 /// Traffic control attach type.
@@ -199,7 +200,7 @@ impl SchedClassifier {
     /// On drop, any managed links are detached and the program is unloaded. This will not result in
     /// the program being unloaded from the kernel if it is still pinned.
     pub fn from_pin<P: AsRef<Path>>(path: P) -> Result<Self, ProgramError> {
-        let data = ProgramData::from_pinned_path(path)?;
+        let data = ProgramData::from_pinned_path(path, VerifierLogLevel::default())?;
         let cname = CString::new(data.name.clone().unwrap_or_default())
             .unwrap()
             .into_boxed_c_str();
@@ -265,13 +266,13 @@ impl SchedClassifierLink {
     /// #     #[error(transparent)]
     /// #     IO(#[from] std::io::Error),
     /// # }
-    /// # fn read_persisted_link_details() -> (String, TcAttachType, u16, u32) {
-    /// #     ("eth0".to_string(), TcAttachType::Ingress, 50, 1)
+    /// # fn read_persisted_link_details() -> (&'static str, TcAttachType, u16, u32) {
+    /// #     ("eth0", TcAttachType::Ingress, 50, 1)
     /// # }
     /// // Get the link parameters from some external source. Where and how the parameters are
     /// // persisted is up to your application.
     /// let (if_name, attach_type, priority, handle) = read_persisted_link_details();
-    /// let new_tc_link = SchedClassifierLink::attached(&if_name, attach_type, priority, handle)?;
+    /// let new_tc_link = SchedClassifierLink::attached(if_name, attach_type, priority, handle)?;
     ///
     /// # Ok::<(), Error>(())
     /// ```

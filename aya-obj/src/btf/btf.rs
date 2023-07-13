@@ -1,10 +1,9 @@
 use core::{ffi::CStr, mem, ptr};
 
 use alloc::{
-    borrow::Cow,
-    ffi::CString,
+    borrow::{Cow, ToOwned as _},
     format,
-    string::{String, ToString},
+    string::String,
     vec,
     vec::Vec,
 };
@@ -166,12 +165,68 @@ pub enum BtfError {
 #[derive(Default, Debug)]
 #[allow(missing_docs)]
 pub struct BtfFeatures {
-    pub btf_func: bool,
-    pub btf_func_global: bool,
-    pub btf_datasec: bool,
-    pub btf_float: bool,
-    pub btf_decl_tag: bool,
-    pub btf_type_tag: bool,
+    btf_func: bool,
+    btf_func_global: bool,
+    btf_datasec: bool,
+    btf_float: bool,
+    btf_decl_tag: bool,
+    btf_type_tag: bool,
+}
+
+impl BtfFeatures {
+    #[doc(hidden)]
+    pub fn new(
+        btf_func: bool,
+        btf_func_global: bool,
+        btf_datasec: bool,
+        btf_float: bool,
+        btf_decl_tag: bool,
+        btf_type_tag: bool,
+    ) -> Self {
+        BtfFeatures {
+            btf_func,
+            btf_func_global,
+            btf_datasec,
+            btf_float,
+            btf_decl_tag,
+            btf_type_tag,
+        }
+    }
+
+    /// Returns true if the BTF_TYPE_FUNC is supported.
+    pub fn btf_func(&self) -> bool {
+        self.btf_func
+    }
+
+    /// Returns true if the BTF_TYPE_FUNC_GLOBAL is supported.
+    pub fn btf_func_global(&self) -> bool {
+        self.btf_func_global
+    }
+
+    /// Returns true if the BTF_TYPE_DATASEC is supported.
+    pub fn btf_datasec(&self) -> bool {
+        self.btf_datasec
+    }
+
+    /// Returns true if the BTF_FLOAT is supported.
+    pub fn btf_float(&self) -> bool {
+        self.btf_float
+    }
+
+    /// Returns true if the BTF_DECL_TAG is supported.
+    pub fn btf_decl_tag(&self) -> bool {
+        self.btf_decl_tag
+    }
+
+    /// Returns true if the BTF_TYPE_TAG is supported.
+    pub fn btf_type_tag(&self) -> bool {
+        self.btf_type_tag
+    }
+
+    /// Returns true if the BTF_KIND_FUNC_PROTO is supported.
+    pub fn btf_kind_func_proto(&self) -> bool {
+        self.btf_func && self.btf_decl_tag
+    }
 }
 
 /// Bpf Type Format metadata.
@@ -220,10 +275,10 @@ impl Btf {
     }
 
     /// Adds a string to BTF metadata, returning an offset
-    pub fn add_string(&mut self, name: String) -> u32 {
-        let str = CString::new(name).unwrap();
+    pub fn add_string(&mut self, name: &str) -> u32 {
+        let str = name.bytes().chain(std::iter::once(0));
         let name_offset = self.strings.len();
-        self.strings.extend(str.as_c_str().to_bytes_with_nul());
+        self.strings.extend(str);
         self.header.str_len = self.strings.len() as u32;
         name_offset as u32
     }
@@ -368,7 +423,7 @@ impl Btf {
         }
 
         Err(BtfError::UnknownBtfTypeName {
-            type_name: name.to_string(),
+            type_name: name.to_owned(),
         })
     }
 
@@ -442,14 +497,13 @@ impl Btf {
 
                     // STRUCT aren't allowed to have "." in their name, fixup this if needed.
                     let mut name_offset = t.name_offset();
-                    let sec_name = self.string_at(name_offset)?;
-                    let name = sec_name.to_string();
+                    let name = self.string_at(name_offset)?;
 
                     // Handle any "." characters in struct names
                     // Example: ".maps"
                     let fixed_name = name.replace('.', "_");
                     if fixed_name != name {
-                        name_offset = self.add_string(fixed_name);
+                        name_offset = self.add_string(&fixed_name);
                     }
 
                     let mut members = vec![];
@@ -470,8 +524,8 @@ impl Btf {
                 // we need to fix them here before loading the btf to the kernel
                 BtfType::DataSec(d) if features.btf_datasec => {
                     // Start DataSec Fixups
-                    let sec_name = self.string_at(d.name_offset)?;
-                    let name = sec_name.to_string();
+                    let name = self.string_at(d.name_offset)?;
+                    let name = name.into_owned();
 
                     let mut fixed_ty = d.clone();
 
@@ -479,7 +533,7 @@ impl Btf {
                     // Example: "maps/hashmap"
                     let fixed_name = name.replace('/', ".");
                     if fixed_name != name {
-                        fixed_ty.name_offset = self.add_string(fixed_name);
+                        fixed_ty.name_offset = self.add_string(&fixed_name);
                     }
 
                     // There are some cases when the compiler does indeed populate the
@@ -490,11 +544,12 @@ impl Btf {
                         // We need to get the size of the section from the ELF file
                         // Fortunately, we cached these when parsing it initially
                         // and we can this up by name in section_infos
-                        let (_, size) = section_infos.get(&name).ok_or_else(|| {
-                            BtfError::UnknownSectionSize {
-                                section_name: name.clone(),
+                        let size = match section_infos.get(&name) {
+                            Some((_, size)) => size,
+                            None => {
+                                return Err(BtfError::UnknownSectionSize { section_name: name });
                             }
-                        })?;
+                        };
                         debug!("{} {}: fixup size to {}", kind, name, size);
                         fixed_ty.size = *size as u32;
 
@@ -507,7 +562,7 @@ impl Btf {
                             let var_type = types.type_by_id(d.btf_type)?;
                             let var_kind = var_type.kind();
                             if let BtfType::Var(var) = var_type {
-                                let var_name = self.string_at(var.name_offset)?.to_string();
+                                let var_name = self.string_at(var.name_offset)?;
                                 if var.linkage == VarLinkage::Static {
                                     debug!(
                                         "{} {}: {} {}: fixup not required",
@@ -516,11 +571,14 @@ impl Btf {
                                     continue;
                                 }
 
-                                let offset = symbol_offsets.get(&var_name).ok_or(
-                                    BtfError::SymbolOffsetNotFound {
-                                        symbol_name: var_name.clone(),
-                                    },
-                                )?;
+                                let offset = match symbol_offsets.get(var_name.as_ref()) {
+                                    Some(offset) => offset,
+                                    None => {
+                                        return Err(BtfError::SymbolOffsetNotFound {
+                                            symbol_name: var_name.into_owned(),
+                                        });
+                                    }
+                                };
                                 d.offset = *offset as u32;
                                 debug!(
                                     "{} {}: {} {}: fixup offset {}",
@@ -538,7 +596,7 @@ impl Btf {
                     let mut ty = ty.clone();
                     for (i, param) in ty.params.iter_mut().enumerate() {
                         if param.name_offset == 0 && param.btf_type != 0 {
-                            param.name_offset = self.add_string(format!("param{i}"));
+                            param.name_offset = self.add_string(&format!("param{i}"));
                         }
                     }
                     types.types[i] = BtfType::FuncProto(ty);
@@ -1107,11 +1165,11 @@ mod tests {
     #[test]
     fn test_write_btf() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
         btf.add_type(int_type);
 
-        let name_offset = btf.add_string("widget".to_string());
+        let name_offset = btf.add_string("widget");
         let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
         btf.add_type(int_type);
 
@@ -1133,7 +1191,7 @@ mod tests {
     #[test]
     fn test_fixup_ptr() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type_id = btf.add_type(BtfType::Int(Int::new(
             name_offset,
             4,
@@ -1141,7 +1199,7 @@ mod tests {
             0,
         )));
 
-        let name_offset = btf.add_string("&mut int".to_string());
+        let name_offset = btf.add_string("&mut int");
         let ptr_type_id = btf.add_type(BtfType::Ptr(Ptr::new(name_offset, int_type_id)));
 
         let features = Default::default();
@@ -1165,7 +1223,7 @@ mod tests {
     #[test]
     fn test_sanitize_var() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type_id = btf.add_type(BtfType::Int(Int::new(
             name_offset,
             4,
@@ -1173,7 +1231,7 @@ mod tests {
             0,
         )));
 
-        let name_offset = btf.add_string("&mut int".to_string());
+        let name_offset = btf.add_string("&mut int");
         let var_type_id = btf.add_type(BtfType::Var(Var::new(
             name_offset,
             int_type_id,
@@ -1200,7 +1258,7 @@ mod tests {
     #[test]
     fn test_sanitize_datasec() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type_id = btf.add_type(BtfType::Int(Int::new(
             name_offset,
             4,
@@ -1208,14 +1266,14 @@ mod tests {
             0,
         )));
 
-        let name_offset = btf.add_string("foo".to_string());
+        let name_offset = btf.add_string("foo");
         let var_type_id = btf.add_type(BtfType::Var(Var::new(
             name_offset,
             int_type_id,
             VarLinkage::Static,
         )));
 
-        let name_offset = btf.add_string("data".to_string());
+        let name_offset = btf.add_string("data");
         let variables = vec![DataSecEntry {
             btf_type: var_type_id,
             offset: 0,
@@ -1247,7 +1305,7 @@ mod tests {
     #[test]
     fn test_fixup_datasec() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type_id = btf.add_type(BtfType::Int(Int::new(
             name_offset,
             4,
@@ -1255,14 +1313,14 @@ mod tests {
             0,
         )));
 
-        let name_offset = btf.add_string("foo".to_string());
+        let name_offset = btf.add_string("foo");
         let var_type_id = btf.add_type(BtfType::Var(Var::new(
             name_offset,
             int_type_id,
             VarLinkage::Global,
         )));
 
-        let name_offset = btf.add_string(".data/foo".to_string());
+        let name_offset = btf.add_string(".data/foo");
         let variables = vec![DataSecEntry {
             btf_type: var_type_id,
             offset: 0,
@@ -1277,8 +1335,8 @@ mod tests {
         };
 
         btf.fixup_and_sanitize(
-            &HashMap::from([(".data/foo".to_string(), (SectionIndex(0), 32u64))]),
-            &HashMap::from([("foo".to_string(), 64u64)]),
+            &HashMap::from([(".data/foo".to_owned(), (SectionIndex(0), 32u64))]),
+            &HashMap::from([("foo".to_owned(), 64u64)]),
             &features,
         )
         .unwrap();
@@ -1305,7 +1363,7 @@ mod tests {
     #[test]
     fn test_sanitize_func_and_proto() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type_id = btf.add_type(BtfType::Int(Int::new(
             name_offset,
             4,
@@ -1315,17 +1373,17 @@ mod tests {
 
         let params = vec![
             BtfParam {
-                name_offset: btf.add_string("a".to_string()),
+                name_offset: btf.add_string("a"),
                 btf_type: int_type_id,
             },
             BtfParam {
-                name_offset: btf.add_string("b".to_string()),
+                name_offset: btf.add_string("b"),
                 btf_type: int_type_id,
             },
         ];
         let func_proto_type_id =
             btf.add_type(BtfType::FuncProto(FuncProto::new(params, int_type_id)));
-        let inc = btf.add_string("inc".to_string());
+        let inc = btf.add_string("inc");
         let func_type_id = btf.add_type(BtfType::Func(Func::new(
             inc,
             func_proto_type_id,
@@ -1364,7 +1422,7 @@ mod tests {
     #[test]
     fn test_fixup_func_proto() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
         let int_type_id = btf.add_type(int_type);
 
@@ -1403,7 +1461,7 @@ mod tests {
     #[test]
     fn test_sanitize_func_global() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type_id = btf.add_type(BtfType::Int(Int::new(
             name_offset,
             4,
@@ -1413,17 +1471,17 @@ mod tests {
 
         let params = vec![
             BtfParam {
-                name_offset: btf.add_string("a".to_string()),
+                name_offset: btf.add_string("a"),
                 btf_type: int_type_id,
             },
             BtfParam {
-                name_offset: btf.add_string("b".to_string()),
+                name_offset: btf.add_string("b"),
                 btf_type: int_type_id,
             },
         ];
         let func_proto_type_id =
             btf.add_type(BtfType::FuncProto(FuncProto::new(params, int_type_id)));
-        let inc = btf.add_string("inc".to_string());
+        let inc = btf.add_string("inc");
         let func_type_id = btf.add_type(BtfType::Func(Func::new(
             inc,
             func_proto_type_id,
@@ -1452,7 +1510,7 @@ mod tests {
     #[test]
     fn test_sanitize_mem_builtins() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type_id = btf.add_type(BtfType::Int(Int::new(
             name_offset,
             4,
@@ -1462,11 +1520,11 @@ mod tests {
 
         let params = vec![
             BtfParam {
-                name_offset: btf.add_string("a".to_string()),
+                name_offset: btf.add_string("a"),
                 btf_type: int_type_id,
             },
             BtfParam {
-                name_offset: btf.add_string("b".to_string()),
+                name_offset: btf.add_string("b"),
                 btf_type: int_type_id,
             },
         ];
@@ -1475,7 +1533,7 @@ mod tests {
 
         let builtins = ["memset", "memcpy", "memcmp", "memmove"];
         for fname in builtins {
-            let func_name_offset = btf.add_string(fname.to_string());
+            let func_name_offset = btf.add_string(fname);
             let func_type_id = btf.add_type(BtfType::Func(Func::new(
                 func_name_offset,
                 func_proto_type_id,
@@ -1506,7 +1564,7 @@ mod tests {
     #[test]
     fn test_sanitize_float() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("float".to_string());
+        let name_offset = btf.add_string("float");
         let float_type_id = btf.add_type(BtfType::Float(Float::new(name_offset, 16)));
 
         let features = BtfFeatures {
@@ -1530,7 +1588,7 @@ mod tests {
     #[test]
     fn test_sanitize_decl_tag() {
         let mut btf = Btf::new();
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let int_type_id = btf.add_type(BtfType::Int(Int::new(
             name_offset,
             4,
@@ -1538,14 +1596,14 @@ mod tests {
             0,
         )));
 
-        let name_offset = btf.add_string("foo".to_string());
+        let name_offset = btf.add_string("foo");
         let var_type_id = btf.add_type(BtfType::Var(Var::new(
             name_offset,
             int_type_id,
             VarLinkage::Static,
         )));
 
-        let name_offset = btf.add_string("decl_tag".to_string());
+        let name_offset = btf.add_string("decl_tag");
         let decl_tag_type_id =
             btf.add_type(BtfType::DeclTag(DeclTag::new(name_offset, var_type_id, -1)));
 
@@ -1573,7 +1631,7 @@ mod tests {
 
         let int_type_id = btf.add_type(BtfType::Int(Int::new(0, 4, IntEncoding::Signed, 0)));
 
-        let name_offset = btf.add_string("int".to_string());
+        let name_offset = btf.add_string("int");
         let type_tag_type = btf.add_type(BtfType::TypeTag(TypeTag::new(name_offset, int_type_id)));
         btf.add_type(BtfType::Ptr(Ptr::new(0, type_tag_type)));
 

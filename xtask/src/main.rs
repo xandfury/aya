@@ -1,13 +1,9 @@
-mod build_ebpf;
-mod build_test;
 mod codegen;
 mod docs;
 mod run;
-pub(crate) mod utils;
-
-use std::process::exit;
 
 use clap::Parser;
+
 #[derive(Parser)]
 pub struct XtaskOptions {
     #[clap(subcommand)]
@@ -18,25 +14,27 @@ pub struct XtaskOptions {
 enum Command {
     Codegen(codegen::Options),
     Docs,
-    BuildIntegrationTest(build_test::Options),
-    BuildIntegrationTestEbpf(build_ebpf::BuildEbpfOptions),
+    BuildIntegrationTest(run::BuildOptions),
     IntegrationTest(run::Options),
 }
 
-fn main() {
-    let opts = XtaskOptions::parse();
+fn main() -> anyhow::Result<()> {
+    let XtaskOptions { command } = Parser::parse();
 
-    use Command::*;
-    let ret = match opts.command {
-        Codegen(opts) => codegen::codegen(opts),
-        Docs => docs::docs(),
-        BuildIntegrationTest(opts) => build_test::build_test(opts),
-        BuildIntegrationTestEbpf(opts) => build_ebpf::build_ebpf(opts),
-        IntegrationTest(opts) => run::run(opts),
-    };
+    match command {
+        Command::Codegen(opts) => codegen::codegen(opts),
+        Command::Docs => docs::docs(),
+        Command::BuildIntegrationTest(opts) => {
+            let binaries = run::build(opts)?;
+            let mut stdout = std::io::stdout();
+            for (_name, binary) in binaries {
+                use std::{io::Write as _, os::unix::ffi::OsStrExt as _};
 
-    if let Err(e) = ret {
-        eprintln!("{e:#}");
-        exit(1);
+                stdout.write_all(binary.as_os_str().as_bytes())?;
+                stdout.write_all("\n".as_bytes())?;
+            }
+            Ok(())
+        }
+        Command::IntegrationTest(opts) => run::run(opts),
     }
 }
