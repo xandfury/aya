@@ -1,6 +1,6 @@
 //! Skmsg programs.
 
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsRawFd;
 
 use crate::{
     generated::{bpf_attach_type::BPF_SK_MSG_VERDICT, bpf_prog_type::BPF_PROG_TYPE_SK_MSG},
@@ -9,7 +9,7 @@ use crate::{
         define_link_wrapper, load_program, ProgAttachLink, ProgAttachLinkId, ProgramData,
         ProgramError,
     },
-    sys::bpf_prog_attach,
+    sys::{bpf_prog_attach, SyscallError},
 };
 
 /// A program used to intercept messages sent with `sendmsg()`/`sendfile()`.
@@ -39,7 +39,7 @@ use crate::{
 /// # let mut bpf = aya::Bpf::load(&[])?;
 /// use std::io::Write;
 /// use std::net::TcpStream;
-/// use std::os::unix::io::AsRawFd;
+/// use std::os::fd::AsRawFd;
 /// use aya::maps::SockHash;
 /// use aya::programs::SkMsg;
 ///
@@ -83,7 +83,7 @@ impl SkMsg {
         let map_fd = map.as_raw_fd();
 
         bpf_prog_attach(prog_fd, map_fd, BPF_SK_MSG_VERDICT).map_err(|(_, io_error)| {
-            ProgramError::SyscallError {
+            SyscallError {
                 call: "bpf_prog_attach",
                 io_error,
             }

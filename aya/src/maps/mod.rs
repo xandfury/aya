@@ -42,9 +42,10 @@ use std::{
     marker::PhantomData,
     mem,
     ops::Deref,
-    os::fd::{AsRawFd, RawFd},
+    os::fd::{AsFd as _, AsRawFd, IntoRawFd as _, OwnedFd, RawFd},
     path::Path,
     ptr,
+    sync::Arc,
 };
 
 use crate::util::KernelVersion;
@@ -57,7 +58,7 @@ use crate::{
     pin::PinError,
     sys::{
         bpf_create_map, bpf_get_object, bpf_map_get_info_by_fd, bpf_map_get_next_key,
-        bpf_pin_object,
+        bpf_pin_object, SyscallError,
     },
     util::nr_cpus,
     PinningType, Pod,
@@ -77,8 +78,8 @@ pub use array::{Array, PerCpuArray, ProgramArray};
 pub use bloom_filter::BloomFilter;
 pub use hash_map::{HashMap, PerCpuHashMap};
 pub use lpm_trie::LpmTrie;
-#[cfg(feature = "async")]
-#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+#[cfg(any(feature = "async_tokio", feature = "async_std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "async_tokio", feature = "async_std"))))]
 pub use perf::AsyncPerfEventArray;
 pub use perf::PerfEventArray;
 pub use queue::Queue;
@@ -166,13 +167,8 @@ pub enum MapError {
     ProgramNotLoaded,
 
     /// Syscall failed
-    #[error("the `{call}` syscall failed")]
-    SyscallError {
-        /// Syscall Name
-        call: &'static str,
-        /// Original io::Error
-        io_error: io::Error,
-    },
+    #[error(transparent)]
+    SyscallError(#[from] SyscallError),
 
     /// Could not pin map by name
     #[error("map `{name:?}` requested pinning by name. pinning failed")]
@@ -349,8 +345,8 @@ impl_try_from_map!(
     StackTraceMap from Map::StackTraceMap,
 );
 
-#[cfg(feature = "async")]
-#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+#[cfg(any(feature = "async_tokio", feature = "async_std"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "async_tokio", feature = "async_std"))))]
 impl_try_from_map!(
     AsyncPerfEventArray from Map::PerfEventArray,
 );
@@ -486,7 +482,7 @@ pub(crate) fn check_v_size<V>(map: &MapData) -> Result<(), MapError> {
 pub struct MapData {
     pub(crate) obj: obj::Map,
     pub(crate) fd: Option<RawFd>,
-    pub(crate) btf_fd: Option<RawFd>,
+    pub(crate) btf_fd: Option<Arc<OwnedFd>>,
     /// Indicates if this map has been pinned to bpffs
     pub pinned: bool,
 }
@@ -504,23 +500,25 @@ impl MapData {
         let kernel_version = KernelVersion::current().unwrap();
         #[cfg(test)]
         let kernel_version = KernelVersion::new(0xff, 0xff, 0xff);
-        let fd = bpf_create_map(&c_name, &self.obj, self.btf_fd, kernel_version).map_err(
-            |(code, io_error)| {
-                if kernel_version < KernelVersion::new(5, 11, 0) {
-                    maybe_warn_rlimit();
-                }
+        let fd = bpf_create_map(
+            &c_name,
+            &self.obj,
+            self.btf_fd.as_ref().map(|f| f.as_fd()),
+            kernel_version,
+        )
+        .map_err(|(code, io_error)| {
+            if kernel_version < KernelVersion::new(5, 11, 0) {
+                maybe_warn_rlimit();
+            }
 
-                MapError::CreateError {
-                    name: name.into(),
-                    code,
-                    io_error,
-                }
-            },
-        )? as RawFd;
+            MapError::CreateError {
+                name: name.into(),
+                code,
+                io_error,
+            }
+        })?;
 
-        self.fd = Some(fd);
-
-        Ok(fd)
+        Ok(*self.fd.insert(fd as RawFd))
     }
 
     pub(crate) fn open_pinned<P: AsRef<Path>>(
@@ -533,14 +531,12 @@ impl MapData {
         }
         let map_path = path.as_ref().join(name);
         let path_string = CString::new(map_path.to_str().unwrap()).unwrap();
-        let fd = bpf_get_object(&path_string).map_err(|(_, io_error)| MapError::SyscallError {
+        let fd = bpf_get_object(&path_string).map_err(|(_, io_error)| SyscallError {
             call: "BPF_OBJ_GET",
             io_error,
-        })? as RawFd;
+        })?;
 
-        self.fd = Some(fd);
-
-        Ok(fd)
+        Ok(*self.fd.insert(fd.into_raw_fd()))
     }
 
     /// Loads a map from a pinned path in bpffs.
@@ -555,38 +551,32 @@ impl MapData {
                 }
             })?;
 
-        let fd = bpf_get_object(&path_string).map_err(|(_, io_error)| MapError::SyscallError {
+        let fd = bpf_get_object(&path_string).map_err(|(_, io_error)| SyscallError {
             call: "BPF_OBJ_GET",
-            io_error,
-        })? as RawFd;
-
-        let info = bpf_map_get_info_by_fd(fd).map_err(|io_error| MapError::SyscallError {
-            call: "BPF_MAP_GET_INFO_BY_FD",
             io_error,
         })?;
 
+        let info = bpf_map_get_info_by_fd(fd.as_fd())?;
+
         Ok(MapData {
             obj: parse_map_info(info, PinningType::ByName),
-            fd: Some(fd),
+            fd: Some(fd.into_raw_fd()),
             btf_fd: None,
             pinned: true,
         })
     }
 
-    /// Loads a map from a [`RawFd`].
+    /// Loads a map from a file descriptor.
     ///
     /// If loading from a BPF Filesystem (bpffs) you should use [`Map::from_pin`](crate::maps::MapData::from_pin).
     /// This API is intended for cases where you have received a valid BPF FD from some other means.
     /// For example, you received an FD over Unix Domain Socket.
-    pub fn from_fd(fd: RawFd) -> Result<MapData, MapError> {
-        let info = bpf_map_get_info_by_fd(fd).map_err(|io_error| MapError::SyscallError {
-            call: "BPF_OBJ_GET",
-            io_error,
-        })?;
+    pub fn from_fd(fd: OwnedFd) -> Result<MapData, MapError> {
+        let info = bpf_map_get_info_by_fd(fd.as_fd())?;
 
         Ok(MapData {
             obj: parse_map_info(info, PinningType::None),
-            fd: Some(fd),
+            fd: Some(fd.into_raw_fd()),
             btf_fd: None,
             pinned: false,
         })
@@ -609,8 +599,8 @@ impl MapData {
                 error: e.to_string(),
             }
         })?;
-        bpf_pin_object(fd, &path_string).map_err(|(_, io_error)| PinError::SyscallError {
-            name: "BPF_OBJ_PIN",
+        bpf_pin_object(fd, &path_string).map_err(|(_, io_error)| SyscallError {
+            call: "BPF_OBJ_PIN",
             io_error,
         })?;
         self.pinned = true;
@@ -639,7 +629,7 @@ impl Clone for MapData {
         MapData {
             obj: self.obj.clone(),
             fd: self.fd.map(|fd| unsafe { libc::dup(fd) }),
-            btf_fd: self.btf_fd,
+            btf_fd: self.btf_fd.as_ref().map(Arc::clone),
             pinned: self.pinned,
         }
     }
@@ -687,21 +677,19 @@ impl<K: Pod> Iterator for MapKeys<'_, K> {
             }
         };
 
-        match bpf_map_get_next_key(fd, self.key.as_ref()) {
-            Ok(Some(key)) => {
-                self.key = Some(key);
-                Some(Ok(key))
-            }
-            Ok(None) => {
-                self.key = None;
-                None
-            }
-            Err((_, io_error)) => {
+        let key =
+            bpf_map_get_next_key(fd, self.key.as_ref()).map_err(|(_, io_error)| SyscallError {
+                call: "bpf_map_get_next_key",
+                io_error,
+            });
+        match key {
+            Err(err) => {
                 self.err = true;
-                Some(Err(MapError::SyscallError {
-                    call: "bpf_map_get_next_key",
-                    io_error,
-                }))
+                Some(Err(err.into()))
+            }
+            Ok(key) => {
+                self.key = key;
+                key.map(Ok)
             }
         }
     }
@@ -842,8 +830,8 @@ impl<T: Pod> Deref for PerCpuValues<T> {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use libc::EFAULT;
-    use matches::assert_matches;
 
     use crate::{
         bpf_map_def,

@@ -1,5 +1,5 @@
 //! Socket option programs.
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsRawFd;
 
 use crate::{
     generated::{bpf_attach_type::BPF_CGROUP_SOCK_OPS, bpf_prog_type::BPF_PROG_TYPE_SOCK_OPS},
@@ -7,7 +7,7 @@ use crate::{
         define_link_wrapper, load_program, ProgAttachLink, ProgAttachLinkId, ProgramData,
         ProgramError,
     },
-    sys::bpf_prog_attach,
+    sys::{bpf_prog_attach, SyscallError},
 };
 
 /// A program used to work with sockets.
@@ -63,7 +63,7 @@ impl SockOps {
         let cgroup_fd = cgroup.as_raw_fd();
 
         bpf_prog_attach(prog_fd, cgroup_fd, BPF_CGROUP_SOCK_OPS).map_err(|(_, io_error)| {
-            ProgramError::SyscallError {
+            SyscallError {
                 call: "bpf_prog_attach",
                 io_error,
             }

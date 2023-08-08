@@ -1,9 +1,15 @@
 //! eXpress Data Path (XDP) programs.
 
-use crate::util::KernelVersion;
+use crate::{sys::SyscallError, util::KernelVersion};
 use bitflags;
 use libc::if_nametoindex;
-use std::{convert::TryFrom, ffi::CString, hash::Hash, io, mem, os::unix::io::RawFd};
+use std::{
+    convert::TryFrom,
+    ffi::CString,
+    hash::Hash,
+    io,
+    os::fd::{AsFd as _, RawFd},
+};
 use thiserror::Error;
 
 use crate::{
@@ -127,11 +133,11 @@ impl Xdp {
 
         if KernelVersion::current().unwrap() >= KernelVersion::new(5, 9, 0) {
             let link_fd = bpf_link_create(prog_fd, if_index, BPF_XDP, None, flags.bits()).map_err(
-                |(_, io_error)| ProgramError::SyscallError {
+                |(_, io_error)| SyscallError {
                     call: "bpf_link_create",
                     io_error,
                 },
-            )? as RawFd;
+            )?;
             self.data
                 .links
                 .insert(XdpLink::new(XdpLinkInner::FdLink(FdLink::new(link_fd))))
@@ -169,17 +175,16 @@ impl Xdp {
     /// Ownership of the link will transfer to this program.
     pub fn attach_to_link(&mut self, link: XdpLink) -> Result<XdpLinkId, ProgramError> {
         let prog_fd = self.data.fd_or_err()?;
-        match link.inner() {
+        match link.into_inner() {
             XdpLinkInner::FdLink(fd_link) => {
                 let link_fd = fd_link.fd;
-                bpf_link_update(link_fd, prog_fd, None, 0).map_err(|(_, io_error)| {
-                    ProgramError::SyscallError {
+                bpf_link_update(link_fd.as_fd(), prog_fd, None, 0).map_err(|(_, io_error)| {
+                    SyscallError {
                         call: "bpf_link_update",
                         io_error,
                     }
                 })?;
-                // dispose of link and avoid detach on drop
-                mem::forget(link);
+
                 self.data
                     .links
                     .insert(XdpLink::new(XdpLinkInner::FdLink(FdLink::new(link_fd))))
@@ -193,8 +198,7 @@ impl Xdp {
                     netlink_set_xdp_fd(if_index, prog_fd, Some(old_prog_fd), replace_flags.bits())
                         .map_err(|io_error| XdpError::NetlinkError { io_error })?;
                 }
-                // dispose of link and avoid detach on drop
-                mem::forget(link);
+
                 self.data
                     .links
                     .insert(XdpLink::new(XdpLinkInner::NlLink(NlLink {
@@ -279,12 +283,7 @@ impl TryFrom<FdLink> for XdpLink {
 
     fn try_from(fd_link: FdLink) -> Result<Self, Self::Error> {
         // unwrap of fd_link.fd will not panic since it's only None when being dropped.
-        let info =
-            bpf_link_get_info_by_fd(fd_link.fd).map_err(|io_error| LinkError::SyscallError {
-                call: "BPF_OBJ_GET_INFO_BY_FD",
-                code: 0,
-                io_error,
-            })?;
+        let info = bpf_link_get_info_by_fd(fd_link.fd.as_fd())?;
         if info.type_ == (bpf_link_type::BPF_LINK_TYPE_XDP as u32) {
             return Ok(XdpLink::new(XdpLinkInner::FdLink(fd_link)));
         }

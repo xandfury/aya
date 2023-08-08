@@ -1,5 +1,7 @@
 //! Perf event programs.
 
+use std::os::fd::AsFd as _;
+
 pub use crate::generated::{
     perf_hw_cache_id, perf_hw_cache_op_id, perf_hw_cache_op_result_id, perf_hw_id, perf_sw_ids,
 };
@@ -19,7 +21,7 @@ use crate::{
         perf_attach::{PerfLinkIdInner, PerfLinkInner},
         FdLink, LinkError, ProgramData, ProgramError,
     },
-    sys::{bpf_link_get_info_by_fd, perf_event_open},
+    sys::{bpf_link_get_info_by_fd, perf_event_open, SyscallError},
 };
 
 /// The type of perf event
@@ -165,10 +167,10 @@ impl PerfEvent {
             false,
             0,
         )
-        .map_err(|(_code, io_error)| ProgramError::SyscallError {
+        .map_err(|(_code, io_error)| SyscallError {
             call: "perf_event_open",
             io_error,
-        })? as i32;
+        })?;
 
         let link = perf_attach(self.data.fd_or_err()?, fd)?;
         self.data.links.insert(PerfEventLink::new(link))
@@ -206,12 +208,7 @@ impl TryFrom<FdLink> for PerfEventLink {
     type Error = LinkError;
 
     fn try_from(fd_link: FdLink) -> Result<Self, Self::Error> {
-        let info =
-            bpf_link_get_info_by_fd(fd_link.fd).map_err(|io_error| LinkError::SyscallError {
-                call: "BPF_OBJ_GET_INFO_BY_FD",
-                code: 0,
-                io_error,
-            })?;
+        let info = bpf_link_get_info_by_fd(fd_link.fd.as_fd())?;
         if info.type_ == (bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32) {
             return Ok(PerfEventLink::new(PerfLinkInner::FdLink(fd_link)));
         }

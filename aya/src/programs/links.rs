@@ -6,7 +6,7 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     ffi::CString,
     io,
-    os::fd::RawFd,
+    os::fd::{AsRawFd as _, OwnedFd, RawFd},
     path::{Path, PathBuf},
 };
 
@@ -14,12 +14,8 @@ use crate::{
     generated::bpf_attach_type,
     pin::PinError,
     programs::ProgramError,
-    sys::{bpf_get_object, bpf_pin_object, bpf_prog_detach},
+    sys::{bpf_get_object, bpf_pin_object, bpf_prog_detach, SyscallError},
 };
-
-// for docs link
-#[allow(unused)]
-use crate::programs::cgroup_skb::CgroupSkb;
 
 /// A Link.
 pub trait Link: std::fmt::Debug + 'static {
@@ -88,8 +84,8 @@ pub struct FdLinkId(pub(crate) RawFd);
 /// A file descriptor link.
 ///
 /// Fd links are returned directly when attaching some program types (for
-/// instance [`CgroupSkb`]), or can be obtained by converting other link
-/// types (see the `TryFrom` implementations).
+/// instance [`crate::programs::cgroup_skb::CgroupSkb`]), or can be obtained by
+/// converting other link types (see the `TryFrom` implementations).
 ///
 /// An important property of fd links is that they can be pinned. Pinning
 /// can be used keep a link attached "in background" even after the program
@@ -112,11 +108,11 @@ pub struct FdLinkId(pub(crate) RawFd);
 /// ```
 #[derive(Debug)]
 pub struct FdLink {
-    pub(crate) fd: RawFd,
+    pub(crate) fd: OwnedFd,
 }
 
 impl FdLink {
-    pub(crate) fn new(fd: RawFd) -> FdLink {
+    pub(crate) fn new(fd: OwnedFd) -> FdLink {
         FdLink { fd }
     }
 
@@ -156,9 +152,11 @@ impl FdLink {
                     error: e.to_string(),
                 }
             })?;
-        bpf_pin_object(self.fd, &path_string).map_err(|(_, io_error)| PinError::SyscallError {
-            name: "BPF_OBJ_PIN",
-            io_error,
+        bpf_pin_object(self.fd.as_raw_fd(), &path_string).map_err(|(_, io_error)| {
+            SyscallError {
+                call: "BPF_OBJ_PIN",
+                io_error,
+            }
         })?;
         Ok(PinnedLink::new(PathBuf::from(path.as_ref()), self))
     }
@@ -168,7 +166,7 @@ impl Link for FdLink {
     type Id = FdLinkId;
 
     fn id(&self) -> Self::Id {
-        FdLinkId(self.fd)
+        FdLinkId(self.fd.as_raw_fd())
     }
 
     fn detach(self) -> Result<(), ProgramError> {
@@ -184,12 +182,6 @@ impl Link for FdLink {
 impl From<PinnedLink> for FdLink {
     fn from(p: PinnedLink) -> Self {
         p.inner
-    }
-}
-
-impl Drop for FdLink {
-    fn drop(&mut self) {
-        unsafe { close(self.fd) };
     }
 }
 
@@ -212,12 +204,12 @@ impl PinnedLink {
     /// Creates a [`crate::programs::links::PinnedLink`] from a valid path on bpffs.
     pub fn from_pin<P: AsRef<Path>>(path: P) -> Result<Self, LinkError> {
         let path_string = CString::new(path.as_ref().to_string_lossy().to_string()).unwrap();
-        let fd =
-            bpf_get_object(&path_string).map_err(|(code, io_error)| LinkError::SyscallError {
+        let fd = bpf_get_object(&path_string).map_err(|(_, io_error)| {
+            LinkError::SyscallError(SyscallError {
                 call: "BPF_OBJ_GET",
-                code,
                 io_error,
-            })? as RawFd;
+            })
+        })?;
         Ok(PinnedLink::new(
             path.as_ref().to_path_buf(),
             FdLink::new(fd),
@@ -343,22 +335,15 @@ pub enum LinkError {
     #[error("Invalid link")]
     InvalidLink,
     /// Syscall failed.
-    #[error("the `{call}` syscall failed with code {code}")]
-    SyscallError {
-        /// Syscall Name.
-        call: &'static str,
-        /// Error code.
-        code: libc::c_long,
-        #[source]
-        /// Original io::Error.
-        io_error: io::Error,
-    },
+    #[error(transparent)]
+    SyscallError(#[from] SyscallError),
 }
 
 #[cfg(test)]
 mod tests {
-    use matches::assert_matches;
-    use std::{cell::RefCell, env, fs::File, mem, os::unix::io::AsRawFd, rc::Rc};
+    use assert_matches::assert_matches;
+    use std::{cell::RefCell, fs::File, rc::Rc};
+    use tempfile::tempdir;
 
     use crate::{programs::ProgramError, sys::override_syscall};
 
@@ -406,16 +391,16 @@ mod tests {
         let id1 = links.insert(l1).unwrap();
         let id2 = links.insert(l2).unwrap();
 
-        assert!(*l1_detached.borrow() == 0);
-        assert!(*l2_detached.borrow() == 0);
+        assert_eq!(*l1_detached.borrow(), 0);
+        assert_eq!(*l2_detached.borrow(), 0);
 
         assert!(links.remove(id1).is_ok());
-        assert!(*l1_detached.borrow() == 1);
-        assert!(*l2_detached.borrow() == 0);
+        assert_eq!(*l1_detached.borrow(), 1);
+        assert_eq!(*l2_detached.borrow(), 0);
 
         assert!(links.remove(id2).is_ok());
-        assert!(*l1_detached.borrow() == 1);
-        assert!(*l2_detached.borrow() == 1);
+        assert_eq!(*l1_detached.borrow(), 1);
+        assert_eq!(*l2_detached.borrow(), 1);
     }
 
     #[test]
@@ -454,12 +439,12 @@ mod tests {
             links.insert(l2).unwrap();
             // manually remove one link
             assert!(links.remove(id1).is_ok());
-            assert!(*l1_detached.borrow() == 1);
-            assert!(*l2_detached.borrow() == 0);
+            assert_eq!(*l1_detached.borrow(), 1);
+            assert_eq!(*l2_detached.borrow(), 0);
         }
         // remove the other on drop
-        assert!(*l1_detached.borrow() == 1);
-        assert!(*l2_detached.borrow() == 1);
+        assert_eq!(*l1_detached.borrow(), 1);
+        assert_eq!(*l2_detached.borrow(), 1);
     }
 
     #[test]
@@ -475,39 +460,37 @@ mod tests {
             links.insert(l2).unwrap();
             // manually forget one link
             let owned_l1 = links.forget(id1);
-            assert!(*l1_detached.borrow() == 0);
-            assert!(*l2_detached.borrow() == 0);
+            assert_eq!(*l1_detached.borrow(), 0);
+            assert_eq!(*l2_detached.borrow(), 0);
             owned_l1.unwrap()
         };
 
         // l2 is detached on `Drop`, but l1 is still alive
-        assert!(*l1_detached.borrow() == 0);
-        assert!(*l2_detached.borrow() == 1);
+        assert_eq!(*l1_detached.borrow(), 0);
+        assert_eq!(*l2_detached.borrow(), 1);
 
         // manually detach l1
         assert!(owned_l1.detach().is_ok());
-        assert!(*l1_detached.borrow() == 1);
-        assert!(*l2_detached.borrow() == 1);
+        assert_eq!(*l1_detached.borrow(), 1);
+        assert_eq!(*l2_detached.borrow(), 1);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_pin() {
-        let dir = env::temp_dir();
-        let f1 = File::create(dir.join("f1")).expect("unable to create file in tmpdir");
-        let fd_link = FdLink::new(f1.as_raw_fd());
-
-        // leak the fd, it will get closed when our pinned link is dropped
-        mem::forget(f1);
+        let dir = tempdir().unwrap();
+        let f1 = File::create(dir.path().join("f1")).expect("unable to create file in tmpdir");
+        let fd_link = FdLink::new(f1.into());
 
         // override syscall to allow for pin to happen in our tmpdir
         override_syscall(|_| Ok(0));
         // create the file that would have happened as a side-effect of a real pin operation
-        File::create(dir.join("f1-pin")).expect("unable to create file in tmpdir");
-        assert!(dir.join("f1-pin").exists());
+        let pin = dir.path().join("f1-pin");
+        File::create(&pin).expect("unable to create file in tmpdir");
+        assert!(pin.exists());
 
-        let pinned_link = fd_link.pin(dir.join("f1-pin")).expect("pin failed");
+        let pinned_link = fd_link.pin(&pin).expect("pin failed");
         pinned_link.unpin().expect("unpin failed");
-        assert!(!dir.join("f1-pin").exists());
+        assert!(!pin.exists());
     }
 }

@@ -1,9 +1,9 @@
 use std::{
     cmp::{self, min},
     ffi::{CStr, CString},
-    io,
+    io, iter,
     mem::{self, MaybeUninit},
-    os::unix::io::RawFd,
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd as _, OwnedFd, RawFd},
     slice,
 };
 
@@ -11,7 +11,7 @@ use crate::util::KernelVersion;
 use libc::{c_char, c_long, close, ENOENT, ENOSPC};
 use obj::{
     maps::{bpf_map_def, LegacyMap},
-    BpfSectionKind,
+    BpfSectionKind, VerifierLog,
 };
 
 use crate::{
@@ -28,16 +28,16 @@ use crate::{
         },
         copy_instructions,
     },
-    sys::{syscall, SysResult, Syscall},
+    sys::{syscall, SysResult, Syscall, SyscallError},
     Btf, Pod, VerifierLogLevel, BPF_OBJ_NAME_LEN,
 };
 
 pub(crate) fn bpf_create_map(
     name: &CStr,
     def: &obj::Map,
-    btf_fd: Option<RawFd>,
+    btf_fd: Option<BorrowedFd<'_>>,
     kernel_version: KernelVersion,
-) -> SysResult {
+) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     let u = unsafe { &mut attr.__bindgen_anon_1 };
@@ -75,7 +75,7 @@ pub(crate) fn bpf_create_map(
             _ => {
                 u.btf_key_type_id = m.def.btf_key_type_id;
                 u.btf_value_type_id = m.def.btf_value_type_id;
-                u.btf_fd = btf_fd.unwrap_or_default() as u32;
+                u.btf_fd = btf_fd.map(|fd| fd.as_raw_fd()).unwrap_or_default() as u32;
             }
         }
     }
@@ -90,22 +90,23 @@ pub(crate) fn bpf_create_map(
             .copy_from_slice(unsafe { slice::from_raw_parts(name.as_ptr(), name_len) });
     }
 
-    sys_bpf(bpf_cmd::BPF_MAP_CREATE, &attr)
+    sys_bpf(bpf_cmd::BPF_MAP_CREATE, &mut attr)
 }
 
-pub(crate) fn bpf_pin_object(fd: RawFd, path: &CStr) -> SysResult {
+pub(crate) fn bpf_pin_object(fd: RawFd, path: &CStr) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     let u = unsafe { &mut attr.__bindgen_anon_4 };
     u.bpf_fd = fd as u32;
     u.pathname = path.as_ptr() as u64;
-    sys_bpf(bpf_cmd::BPF_OBJ_PIN, &attr)
+    sys_bpf(bpf_cmd::BPF_OBJ_PIN, &mut attr)
 }
 
-pub(crate) fn bpf_get_object(path: &CStr) -> SysResult {
+pub(crate) fn bpf_get_object(path: &CStr) -> SysResult<OwnedFd> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     let u = unsafe { &mut attr.__bindgen_anon_4 };
     u.pathname = path.as_ptr() as u64;
-    sys_bpf(bpf_cmd::BPF_OBJ_GET, &attr)
+    // SAFETY: BPF_OBJ_GET returns a new file descriptor.
+    unsafe { fd_sys_bpf(bpf_cmd::BPF_OBJ_GET, &mut attr) }
 }
 
 pub(crate) struct BpfLoadProgramAttrs<'a> {
@@ -115,7 +116,7 @@ pub(crate) struct BpfLoadProgramAttrs<'a> {
     pub(crate) license: &'a CStr,
     pub(crate) kernel_version: u32,
     pub(crate) expected_attach_type: Option<bpf_attach_type>,
-    pub(crate) prog_btf_fd: Option<RawFd>,
+    pub(crate) prog_btf_fd: Option<BorrowedFd<'a>>,
     pub(crate) attach_btf_obj_fd: Option<u32>,
     pub(crate) attach_btf_id: Option<u32>,
     pub(crate) attach_prog_fd: Option<RawFd>,
@@ -130,7 +131,7 @@ pub(crate) fn bpf_load_program(
     aya_attr: &BpfLoadProgramAttrs,
     log_buf: &mut [u8],
     verifier_log_level: VerifierLogLevel,
-) -> SysResult {
+) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     let u = unsafe { &mut attr.__bindgen_anon_3 };
@@ -161,7 +162,7 @@ pub(crate) fn bpf_load_program(
     let func_info_buf = aya_attr.func_info.func_info_bytes();
 
     if let Some(btf_fd) = aya_attr.prog_btf_fd {
-        u.prog_btf_fd = btf_fd as u32;
+        u.prog_btf_fd = btf_fd.as_raw_fd() as u32;
         if aya_attr.line_info_rec_size > 0 {
             u.line_info = line_info_buf.as_ptr() as *const _ as u64;
             u.line_info_cnt = aya_attr.line_info.len() as u32;
@@ -188,7 +189,7 @@ pub(crate) fn bpf_load_program(
     if let Some(v) = aya_attr.attach_btf_id {
         u.attach_btf_id = v;
     }
-    sys_bpf(bpf_cmd::BPF_PROG_LOAD, &attr)
+    sys_bpf(bpf_cmd::BPF_PROG_LOAD, &mut attr)
 }
 
 fn lookup<K: Pod, V: Pod>(
@@ -208,7 +209,7 @@ fn lookup<K: Pod, V: Pod>(
     u.__bindgen_anon_1.value = &mut value as *mut _ as u64;
     u.flags = flags;
 
-    match sys_bpf(cmd, &attr) {
+    match sys_bpf(cmd, &mut attr) {
         Ok(_) => Ok(Some(unsafe { value.assume_init() })),
         Err((_, io_error)) if io_error.raw_os_error() == Some(ENOENT) => Ok(None),
         Err(e) => Err(e),
@@ -260,7 +261,7 @@ pub(crate) fn bpf_map_lookup_elem_ptr<K: Pod, V>(
     u.__bindgen_anon_1.value = value as u64;
     u.flags = flags;
 
-    match sys_bpf(bpf_cmd::BPF_MAP_LOOKUP_ELEM, &attr) {
+    match sys_bpf(bpf_cmd::BPF_MAP_LOOKUP_ELEM, &mut attr) {
         Ok(_) => Ok(Some(())),
         Err((_, io_error)) if io_error.raw_os_error() == Some(ENOENT) => Ok(None),
         Err(e) => Err(e),
@@ -272,7 +273,7 @@ pub(crate) fn bpf_map_update_elem<K: Pod, V: Pod>(
     key: Option<&K>,
     value: &V,
     flags: u64,
-) -> SysResult {
+) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     let u = unsafe { &mut attr.__bindgen_anon_2 };
@@ -283,10 +284,10 @@ pub(crate) fn bpf_map_update_elem<K: Pod, V: Pod>(
     u.__bindgen_anon_1.value = value as *const _ as u64;
     u.flags = flags;
 
-    sys_bpf(bpf_cmd::BPF_MAP_UPDATE_ELEM, &attr)
+    sys_bpf(bpf_cmd::BPF_MAP_UPDATE_ELEM, &mut attr)
 }
 
-pub(crate) fn bpf_map_push_elem<V: Pod>(fd: RawFd, value: &V, flags: u64) -> SysResult {
+pub(crate) fn bpf_map_push_elem<V: Pod>(fd: RawFd, value: &V, flags: u64) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     let u = unsafe { &mut attr.__bindgen_anon_2 };
@@ -294,7 +295,7 @@ pub(crate) fn bpf_map_push_elem<V: Pod>(fd: RawFd, value: &V, flags: u64) -> Sys
     u.__bindgen_anon_1.value = value as *const _ as u64;
     u.flags = flags;
 
-    sys_bpf(bpf_cmd::BPF_MAP_UPDATE_ELEM, &attr)
+    sys_bpf(bpf_cmd::BPF_MAP_UPDATE_ELEM, &mut attr)
 }
 
 pub(crate) fn bpf_map_update_elem_ptr<K, V>(
@@ -302,7 +303,7 @@ pub(crate) fn bpf_map_update_elem_ptr<K, V>(
     key: *const K,
     value: *mut V,
     flags: u64,
-) -> SysResult {
+) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     let u = unsafe { &mut attr.__bindgen_anon_2 };
@@ -311,7 +312,7 @@ pub(crate) fn bpf_map_update_elem_ptr<K, V>(
     u.__bindgen_anon_1.value = value as u64;
     u.flags = flags;
 
-    sys_bpf(bpf_cmd::BPF_MAP_UPDATE_ELEM, &attr)
+    sys_bpf(bpf_cmd::BPF_MAP_UPDATE_ELEM, &mut attr)
 }
 
 pub(crate) fn bpf_map_update_elem_per_cpu<K: Pod, V: Pod>(
@@ -319,19 +320,19 @@ pub(crate) fn bpf_map_update_elem_per_cpu<K: Pod, V: Pod>(
     key: &K,
     values: &PerCpuValues<V>,
     flags: u64,
-) -> SysResult {
+) -> SysResult<c_long> {
     let mut mem = values.build_kernel_mem().map_err(|e| (-1, e))?;
     bpf_map_update_elem_ptr(fd, key, mem.as_mut_ptr(), flags)
 }
 
-pub(crate) fn bpf_map_delete_elem<K: Pod>(fd: RawFd, key: &K) -> SysResult {
+pub(crate) fn bpf_map_delete_elem<K: Pod>(fd: RawFd, key: &K) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     let u = unsafe { &mut attr.__bindgen_anon_2 };
     u.map_fd = fd as u32;
     u.key = key as *const _ as u64;
 
-    sys_bpf(bpf_cmd::BPF_MAP_DELETE_ELEM, &attr)
+    sys_bpf(bpf_cmd::BPF_MAP_DELETE_ELEM, &mut attr)
 }
 
 pub(crate) fn bpf_map_get_next_key<K: Pod>(
@@ -348,7 +349,7 @@ pub(crate) fn bpf_map_get_next_key<K: Pod>(
     }
     u.__bindgen_anon_1.next_key = &mut next_key as *mut _ as u64;
 
-    match sys_bpf(bpf_cmd::BPF_MAP_GET_NEXT_KEY, &attr) {
+    match sys_bpf(bpf_cmd::BPF_MAP_GET_NEXT_KEY, &mut attr) {
         Ok(_) => Ok(Some(unsafe { next_key.assume_init() })),
         Err((_, io_error)) if io_error.raw_os_error() == Some(ENOENT) => Ok(None),
         Err(e) => Err(e),
@@ -356,11 +357,11 @@ pub(crate) fn bpf_map_get_next_key<K: Pod>(
 }
 
 // since kernel 5.2
-pub(crate) fn bpf_map_freeze(fd: RawFd) -> SysResult {
+pub(crate) fn bpf_map_freeze(fd: RawFd) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     let u = unsafe { &mut attr.__bindgen_anon_2 };
     u.map_fd = fd as u32;
-    sys_bpf(bpf_cmd::BPF_MAP_FREEZE, &attr)
+    sys_bpf(bpf_cmd::BPF_MAP_FREEZE, &mut attr)
 }
 
 // since kernel 5.7
@@ -370,7 +371,7 @@ pub(crate) fn bpf_link_create(
     attach_type: bpf_attach_type,
     btf_id: Option<u32>,
     flags: u32,
-) -> SysResult {
+) -> SysResult<OwnedFd> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     attr.link_create.__bindgen_anon_1.prog_fd = prog_fd as u32;
@@ -381,19 +382,20 @@ pub(crate) fn bpf_link_create(
         attr.link_create.__bindgen_anon_3.target_btf_id = btf_id;
     }
 
-    sys_bpf(bpf_cmd::BPF_LINK_CREATE, &attr)
+    // SAFETY: BPF_LINK_CREATE returns a new file descriptor.
+    unsafe { fd_sys_bpf(bpf_cmd::BPF_LINK_CREATE, &mut attr) }
 }
 
 // since kernel 5.7
 pub(crate) fn bpf_link_update(
-    link_fd: RawFd,
+    link_fd: BorrowedFd<'_>,
     new_prog_fd: RawFd,
     old_prog_fd: Option<RawFd>,
     flags: u32,
-) -> SysResult {
+) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
-    attr.link_update.link_fd = link_fd as u32;
+    attr.link_update.link_fd = link_fd.as_raw_fd() as u32;
     attr.link_update.__bindgen_anon_1.new_prog_fd = new_prog_fd as u32;
     if let Some(fd) = old_prog_fd {
         attr.link_update.__bindgen_anon_2.old_prog_fd = fd as u32;
@@ -402,35 +404,35 @@ pub(crate) fn bpf_link_update(
         attr.link_update.flags = flags;
     }
 
-    sys_bpf(bpf_cmd::BPF_LINK_UPDATE, &attr)
+    sys_bpf(bpf_cmd::BPF_LINK_UPDATE, &mut attr)
 }
 
 pub(crate) fn bpf_prog_attach(
     prog_fd: RawFd,
     target_fd: RawFd,
     attach_type: bpf_attach_type,
-) -> SysResult {
+) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     attr.__bindgen_anon_5.attach_bpf_fd = prog_fd as u32;
     attr.__bindgen_anon_5.target_fd = target_fd as u32;
     attr.__bindgen_anon_5.attach_type = attach_type as u32;
 
-    sys_bpf(bpf_cmd::BPF_PROG_ATTACH, &attr)
+    sys_bpf(bpf_cmd::BPF_PROG_ATTACH, &mut attr)
 }
 
 pub(crate) fn bpf_prog_detach(
     prog_fd: RawFd,
     map_fd: RawFd,
     attach_type: bpf_attach_type,
-) -> SysResult {
+) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     attr.__bindgen_anon_5.attach_bpf_fd = prog_fd as u32;
     attr.__bindgen_anon_5.target_fd = map_fd as u32;
     attr.__bindgen_anon_5.attach_type = attach_type as u32;
 
-    sys_bpf(bpf_cmd::BPF_PROG_DETACH, &attr)
+    sys_bpf(bpf_cmd::BPF_PROG_DETACH, &mut attr)
 }
 
 pub(crate) fn bpf_prog_query(
@@ -440,7 +442,7 @@ pub(crate) fn bpf_prog_query(
     attach_flags: Option<&mut u32>,
     prog_ids: &mut [u32],
     prog_cnt: &mut u32,
-) -> SysResult {
+) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     attr.query.target_fd = target_fd as u32;
@@ -449,7 +451,7 @@ pub(crate) fn bpf_prog_query(
     attr.query.prog_cnt = prog_ids.len() as u32;
     attr.query.prog_ids = prog_ids.as_mut_ptr() as u64;
 
-    let ret = sys_bpf(bpf_cmd::BPF_PROG_QUERY, &attr);
+    let ret = sys_bpf(bpf_cmd::BPF_PROG_QUERY, &mut attr);
 
     *prog_cnt = unsafe { attr.query.prog_cnt };
 
@@ -460,65 +462,74 @@ pub(crate) fn bpf_prog_query(
     ret
 }
 
-pub(crate) fn bpf_prog_get_fd_by_id(prog_id: u32) -> Result<RawFd, io::Error> {
+pub(crate) fn bpf_prog_get_fd_by_id(prog_id: u32) -> Result<OwnedFd, SyscallError> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     attr.__bindgen_anon_6.__bindgen_anon_1.prog_id = prog_id;
-
-    match sys_bpf(bpf_cmd::BPF_PROG_GET_FD_BY_ID, &attr) {
-        Ok(v) => Ok(v as RawFd),
-        Err((_, err)) => Err(err),
-    }
+    // SAFETY: BPF_PROG_GET_FD_BY_ID returns a new file descriptor.
+    unsafe { fd_sys_bpf(bpf_cmd::BPF_PROG_GET_FD_BY_ID, &mut attr) }.map_err(|(code, io_error)| {
+        assert_eq!(code, -1);
+        SyscallError {
+            call: "bpf_prog_get_fd_by_id",
+            io_error,
+        }
+    })
 }
 
-pub(crate) fn bpf_prog_get_info_by_fd(prog_fd: RawFd) -> Result<bpf_prog_info, io::Error> {
+fn bpf_obj_get_info_by_fd<T>(fd: BorrowedFd<'_>) -> Result<T, SyscallError> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     // info gets entirely populated by the kernel
     let info = MaybeUninit::zeroed();
 
-    attr.info.bpf_fd = prog_fd as u32;
+    attr.info.bpf_fd = fd.as_raw_fd() as u32;
     attr.info.info = &info as *const _ as u64;
-    attr.info.info_len = mem::size_of::<bpf_prog_info>() as u32;
+    attr.info.info_len = mem::size_of_val(&info) as u32;
 
-    match sys_bpf(bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, &attr) {
-        Ok(_) => Ok(unsafe { info.assume_init() }),
-        Err((_, err)) => Err(err),
+    match sys_bpf(bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, &mut attr) {
+        Ok(code) => {
+            assert_eq!(code, 0);
+            Ok(unsafe { info.assume_init() })
+        }
+        Err((code, io_error)) => {
+            assert_eq!(code, -1);
+            Err(SyscallError {
+                call: "bpf_obj_get_info_by_fd",
+                io_error,
+            })
+        }
     }
 }
 
-pub(crate) fn bpf_map_get_info_by_fd(prog_fd: RawFd) -> Result<bpf_map_info, io::Error> {
-    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
-    // info gets entirely populated by the kernel
-    let info = MaybeUninit::zeroed();
-
-    attr.info.bpf_fd = prog_fd as u32;
-    attr.info.info = info.as_ptr() as *const _ as u64;
-    attr.info.info_len = mem::size_of::<bpf_map_info>() as u32;
-
-    match sys_bpf(bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, &attr) {
-        Ok(_) => Ok(unsafe { info.assume_init() }),
-        Err((_, err)) => Err(err),
-    }
+pub(crate) fn bpf_prog_get_info_by_fd(fd: RawFd) -> Result<bpf_prog_info, SyscallError> {
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    bpf_obj_get_info_by_fd::<bpf_prog_info>(fd)
 }
 
-pub(crate) fn bpf_link_get_info_by_fd(link_fd: RawFd) -> Result<bpf_link_info, io::Error> {
+pub(crate) fn bpf_map_get_info_by_fd(fd: BorrowedFd<'_>) -> Result<bpf_map_info, SyscallError> {
+    bpf_obj_get_info_by_fd::<bpf_map_info>(fd)
+}
+
+pub(crate) fn bpf_link_get_fd_by_id(link_id: u32) -> Result<OwnedFd, SyscallError> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
-    // info gets entirely populated by the kernel
-    let info = unsafe { MaybeUninit::zeroed().assume_init() };
 
-    attr.info.bpf_fd = link_fd as u32;
-    attr.info.info = &info as *const _ as u64;
-    attr.info.info_len = mem::size_of::<bpf_link_info>() as u32;
+    attr.__bindgen_anon_6.__bindgen_anon_1.link_id = link_id;
+    // SAFETY: BPF_LINK_GET_FD_BY_ID returns a new file descriptor.
+    unsafe { fd_sys_bpf(bpf_cmd::BPF_LINK_GET_FD_BY_ID, &mut attr) }.map_err(|(code, io_error)| {
+        assert_eq!(code, -1);
+        SyscallError {
+            call: "bpf_link_get_fd_by_id",
+            io_error,
+        }
+    })
+}
 
-    match sys_bpf(bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, &attr) {
-        Ok(_) => Ok(info),
-        Err((_, err)) => Err(err),
-    }
+pub(crate) fn bpf_link_get_info_by_fd(fd: BorrowedFd<'_>) -> Result<bpf_link_info, SyscallError> {
+    bpf_obj_get_info_by_fd::<bpf_link_info>(fd)
 }
 
 pub(crate) fn btf_obj_get_info_by_fd(
     prog_fd: RawFd,
-    buf: &mut [u8],
+    buf: &[u8],
 ) -> Result<bpf_btf_info, io::Error> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     let mut info = unsafe { mem::zeroed::<bpf_btf_info>() };
@@ -529,13 +540,13 @@ pub(crate) fn btf_obj_get_info_by_fd(
     attr.info.info = &info as *const bpf_btf_info as u64;
     attr.info.info_len = mem::size_of::<bpf_btf_info>() as u32;
 
-    match sys_bpf(bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, &attr) {
+    match sys_bpf(bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, &mut attr) {
         Ok(_) => Ok(info),
         Err((_, err)) => Err(err),
     }
 }
 
-pub(crate) fn bpf_raw_tracepoint_open(name: Option<&CStr>, prog_fd: RawFd) -> SysResult {
+pub(crate) fn bpf_raw_tracepoint_open(name: Option<&CStr>, prog_fd: RawFd) -> SysResult<OwnedFd> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     attr.raw_tracepoint.name = match name {
@@ -544,14 +555,15 @@ pub(crate) fn bpf_raw_tracepoint_open(name: Option<&CStr>, prog_fd: RawFd) -> Sy
     };
     attr.raw_tracepoint.prog_fd = prog_fd as u32;
 
-    sys_bpf(bpf_cmd::BPF_RAW_TRACEPOINT_OPEN, &attr)
+    // SAFETY: BPF_RAW_TRACEPOINT_OPEN returns a new file descriptor.
+    unsafe { fd_sys_bpf(bpf_cmd::BPF_RAW_TRACEPOINT_OPEN, &mut attr) }
 }
 
 pub(crate) fn bpf_load_btf(
     raw_btf: &[u8],
     log_buf: &mut [u8],
     verifier_log_level: VerifierLogLevel,
-) -> SysResult {
+) -> SysResult<OwnedFd> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     let u = unsafe { &mut attr.__bindgen_anon_7 };
     u.btf = raw_btf.as_ptr() as *const _ as u64;
@@ -561,14 +573,30 @@ pub(crate) fn bpf_load_btf(
         u.btf_log_buf = log_buf.as_mut_ptr() as u64;
         u.btf_log_size = log_buf.len() as u32;
     }
-    sys_bpf(bpf_cmd::BPF_BTF_LOAD, &attr)
+    // SAFETY: `BPF_BTF_LOAD` returns a newly created fd.
+    unsafe { fd_sys_bpf(bpf_cmd::BPF_BTF_LOAD, &mut attr) }
+}
+
+// SAFETY: only use for bpf_cmd that return a new file descriptor on success.
+unsafe fn fd_sys_bpf(cmd: bpf_cmd, attr: &mut bpf_attr) -> SysResult<OwnedFd> {
+    let fd = sys_bpf(cmd, attr)?;
+    let fd = fd.try_into().map_err(|_| {
+        (
+            fd,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{cmd:?}: invalid fd returned: {fd}"),
+            ),
+        )
+    })?;
+    Ok(OwnedFd::from_raw_fd(fd))
 }
 
 pub(crate) fn bpf_btf_get_fd_by_id(id: u32) -> Result<RawFd, io::Error> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     attr.__bindgen_anon_6.__bindgen_anon_1.btf_id = id;
 
-    match sys_bpf(bpf_cmd::BPF_BTF_GET_FD_BY_ID, &attr) {
+    match sys_bpf(bpf_cmd::BPF_BTF_GET_FD_BY_ID, &mut attr) {
         Ok(v) => Ok(v as RawFd),
         Err((_, err)) => Err(err),
     }
@@ -599,7 +627,7 @@ pub(crate) fn is_prog_name_supported() -> bool {
     u.insns = insns.as_ptr() as u64;
     u.prog_type = bpf_prog_type::BPF_PROG_TYPE_SOCKET_FILTER as u32;
 
-    match sys_bpf(bpf_cmd::BPF_PROG_LOAD, &attr) {
+    match sys_bpf(bpf_cmd::BPF_PROG_LOAD, &mut attr) {
         Ok(v) => {
             let fd = v as RawFd;
             unsafe { close(fd) };
@@ -630,7 +658,7 @@ pub(crate) fn is_probe_read_kernel_supported() -> bool {
     u.insns = insns.as_ptr() as u64;
     u.prog_type = bpf_prog_type::BPF_PROG_TYPE_TRACEPOINT as u32;
 
-    match sys_bpf(bpf_cmd::BPF_PROG_LOAD, &attr) {
+    match sys_bpf(bpf_cmd::BPF_PROG_LOAD, &mut attr) {
         Ok(v) => {
             let fd = v as RawFd;
             unsafe { close(fd) };
@@ -657,7 +685,7 @@ pub(crate) fn is_perf_link_supported() -> bool {
     u.insns = insns.as_ptr() as u64;
     u.prog_type = bpf_prog_type::BPF_PROG_TYPE_TRACEPOINT as u32;
 
-    if let Ok(fd) = sys_bpf(bpf_cmd::BPF_PROG_LOAD, &attr) {
+    if let Ok(fd) = sys_bpf(bpf_cmd::BPF_PROG_LOAD, &mut attr) {
         if let Err((_, e)) =
             // Uses an invalid target FD so we get EBADF if supported.
             bpf_link_create(fd as i32, -1, bpf_attach_type::BPF_PERF_EVENT, None, 0)
@@ -713,7 +741,7 @@ pub(crate) fn is_bpf_global_data_supported() -> bool {
         u.insns = insns.as_ptr() as u64;
         u.prog_type = bpf_prog_type::BPF_PROG_TYPE_SOCKET_FILTER as u32;
 
-        if let Ok(v) = sys_bpf(bpf_cmd::BPF_PROG_LOAD, &attr) {
+        if let Ok(v) = sys_bpf(bpf_cmd::BPF_PROG_LOAD, &mut attr) {
             let fd = v as RawFd;
 
             unsafe { close(fd) };
@@ -742,7 +770,7 @@ pub(crate) fn is_bpf_cookie_supported() -> bool {
     u.insns = insns.as_ptr() as u64;
     u.prog_type = bpf_prog_type::BPF_PROG_TYPE_KPROBE as u32;
 
-    match sys_bpf(bpf_cmd::BPF_PROG_LOAD, &attr) {
+    match sys_bpf(bpf_cmd::BPF_PROG_LOAD, &mut attr) {
         Ok(v) => {
             let fd = v as RawFd;
             unsafe { close(fd) };
@@ -758,20 +786,7 @@ pub(crate) fn is_btf_supported() -> bool {
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
     btf.add_type(int_type);
     let btf_bytes = btf.to_bytes();
-
-    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
-    let u = unsafe { &mut attr.__bindgen_anon_7 };
-    u.btf = btf_bytes.as_ptr() as u64;
-    u.btf_size = btf_bytes.len() as u32;
-
-    match sys_bpf(bpf_cmd::BPF_BTF_LOAD, &attr) {
-        Ok(v) => {
-            let fd = v as RawFd;
-            unsafe { close(fd) };
-            true
-        }
-        Err(_) => false,
-    }
+    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
 }
 
 pub(crate) fn is_btf_func_supported() -> bool {
@@ -801,19 +816,7 @@ pub(crate) fn is_btf_func_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
-    let u = unsafe { &mut attr.__bindgen_anon_7 };
-    u.btf = btf_bytes.as_ptr() as u64;
-    u.btf_size = btf_bytes.len() as u32;
-
-    match sys_bpf(bpf_cmd::BPF_BTF_LOAD, &attr) {
-        Ok(v) => {
-            let fd = v as RawFd;
-            unsafe { close(fd) };
-            true
-        }
-        Err(_) => false,
-    }
+    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
 }
 
 pub(crate) fn is_btf_func_global_supported() -> bool {
@@ -843,19 +846,7 @@ pub(crate) fn is_btf_func_global_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
-    let u = unsafe { &mut attr.__bindgen_anon_7 };
-    u.btf = btf_bytes.as_ptr() as u64;
-    u.btf_size = btf_bytes.len() as u32;
-
-    match sys_bpf(bpf_cmd::BPF_BTF_LOAD, &attr) {
-        Ok(v) => {
-            let fd = v as RawFd;
-            unsafe { close(fd) };
-            true
-        }
-        Err(_) => false,
-    }
+    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
 }
 
 pub(crate) fn is_btf_datasec_supported() -> bool {
@@ -879,19 +870,7 @@ pub(crate) fn is_btf_datasec_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
-    let u = unsafe { &mut attr.__bindgen_anon_7 };
-    u.btf = btf_bytes.as_ptr() as u64;
-    u.btf_size = btf_bytes.len() as u32;
-
-    match sys_bpf(bpf_cmd::BPF_BTF_LOAD, &attr) {
-        Ok(v) => {
-            let fd = v as RawFd;
-            unsafe { close(fd) };
-            true
-        }
-        Err(_) => false,
-    }
+    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
 }
 
 pub(crate) fn is_btf_float_supported() -> bool {
@@ -902,19 +881,7 @@ pub(crate) fn is_btf_float_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
-    let u = unsafe { &mut attr.__bindgen_anon_7 };
-    u.btf = btf_bytes.as_ptr() as u64;
-    u.btf_size = btf_bytes.len() as u32;
-
-    match sys_bpf(bpf_cmd::BPF_BTF_LOAD, &attr) {
-        Ok(v) => {
-            let fd = v as RawFd;
-            unsafe { close(fd) };
-            true
-        }
-        Err(_) => false,
-    }
+    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
 }
 
 pub(crate) fn is_btf_decl_tag_supported() -> bool {
@@ -933,19 +900,7 @@ pub(crate) fn is_btf_decl_tag_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
-    let u = unsafe { &mut attr.__bindgen_anon_7 };
-    u.btf = btf_bytes.as_ptr() as u64;
-    u.btf_size = btf_bytes.len() as u32;
-
-    match sys_bpf(bpf_cmd::BPF_BTF_LOAD, &attr) {
-        Ok(v) => {
-            let fd = v as RawFd;
-            unsafe { close(fd) };
-            true
-        }
-        Err(_) => false,
-    }
+    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
 }
 
 pub(crate) fn is_btf_type_tag_supported() -> bool {
@@ -962,40 +917,70 @@ pub(crate) fn is_btf_type_tag_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
-    let u = unsafe { &mut attr.__bindgen_anon_7 };
-    u.btf = btf_bytes.as_ptr() as u64;
-    u.btf_size = btf_bytes.len() as u32;
-
-    match sys_bpf(bpf_cmd::BPF_BTF_LOAD, &attr) {
-        Ok(v) => {
-            let fd = v as RawFd;
-            unsafe { close(fd) };
-            true
-        }
-        Err(_) => false,
-    }
+    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
 }
 
-pub fn sys_bpf(cmd: bpf_cmd, attr: &bpf_attr) -> SysResult {
+fn sys_bpf(cmd: bpf_cmd, attr: &mut bpf_attr) -> SysResult<c_long> {
     syscall(Syscall::Bpf { cmd, attr })
 }
 
-pub(crate) fn bpf_prog_get_next_id(id: u32) -> Result<Option<u32>, (c_long, io::Error)> {
+fn bpf_obj_get_next_id(
+    id: u32,
+    cmd: bpf_cmd,
+    name: &'static str,
+) -> Result<Option<u32>, SyscallError> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     let u = unsafe { &mut attr.__bindgen_anon_6 };
     u.__bindgen_anon_1.start_id = id;
-    match sys_bpf(bpf_cmd::BPF_PROG_GET_NEXT_ID, &attr) {
-        Ok(_) => Ok(Some(unsafe { attr.__bindgen_anon_6.next_id })),
-        Err((_, io_error)) if io_error.raw_os_error() == Some(ENOENT) => Ok(None),
-        Err(e) => Err(e),
+    match sys_bpf(cmd, &mut attr) {
+        Ok(code) => {
+            assert_eq!(code, 0);
+            Ok(Some(unsafe { attr.__bindgen_anon_6.next_id }))
+        }
+        Err((code, io_error)) => {
+            assert_eq!(code, -1);
+            if io_error.raw_os_error() == Some(ENOENT) {
+                Ok(None)
+            } else {
+                Err(SyscallError {
+                    call: name,
+                    io_error,
+                })
+            }
+        }
     }
 }
 
-pub(crate) fn retry_with_verifier_logs(
+fn iter_obj_ids(
+    cmd: bpf_cmd,
+    name: &'static str,
+) -> impl Iterator<Item = Result<u32, SyscallError>> {
+    let mut current_id = Some(0);
+    iter::from_fn(move || {
+        let next_id = {
+            let current_id = current_id?;
+            bpf_obj_get_next_id(current_id, cmd, name).transpose()
+        };
+        current_id = next_id.as_ref().and_then(|next_id| match next_id {
+            Ok(next_id) => Some(*next_id),
+            Err(SyscallError { .. }) => None,
+        });
+        next_id
+    })
+}
+
+pub(crate) fn iter_prog_ids() -> impl Iterator<Item = Result<u32, SyscallError>> {
+    iter_obj_ids(bpf_cmd::BPF_PROG_GET_NEXT_ID, "bpf_prog_get_next_id")
+}
+
+pub(crate) fn iter_link_ids() -> impl Iterator<Item = Result<u32, SyscallError>> {
+    iter_obj_ids(bpf_cmd::BPF_LINK_GET_NEXT_ID, "bpf_link_get_next_id")
+}
+
+pub(crate) fn retry_with_verifier_logs<T>(
     max_retries: usize,
-    f: impl Fn(&mut [u8]) -> SysResult,
-) -> (SysResult, String) {
+    f: impl Fn(&mut [u8]) -> SysResult<T>,
+) -> (SysResult<T>, VerifierLog) {
     const MIN_LOG_BUF_SIZE: usize = 1024 * 10;
     const MAX_LOG_BUF_SIZE: usize = (std::u32::MAX >> 8) as usize;
 
@@ -1021,7 +1006,7 @@ pub(crate) fn retry_with_verifier_logs(
         }
         let log_buf = String::from_utf8(log_buf).unwrap();
 
-        break (ret, log_buf);
+        break (ret, VerifierLog::new(log_buf));
     }
 }
 

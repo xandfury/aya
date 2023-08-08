@@ -1,7 +1,7 @@
 //! Hash map types.
 use crate::{
     maps::MapError,
-    sys::{bpf_map_delete_elem, bpf_map_update_elem},
+    sys::{bpf_map_delete_elem, bpf_map_update_elem, SyscallError},
     Pod,
 };
 
@@ -15,28 +15,29 @@ pub use per_cpu_hash_map::*;
 use super::MapData;
 
 pub(crate) fn insert<K: Pod, V: Pod>(
-    map: &mut MapData,
+    map: &MapData,
     key: &K,
     value: &V,
     flags: u64,
 ) -> Result<(), MapError> {
     let fd = map.fd_or_err()?;
-    bpf_map_update_elem(fd, Some(key), value, flags).map_err(|(_, io_error)| {
-        MapError::SyscallError {
-            call: "bpf_map_update_elem",
-            io_error,
-        }
+    bpf_map_update_elem(fd, Some(key), value, flags).map_err(|(_, io_error)| SyscallError {
+        call: "bpf_map_update_elem",
+        io_error,
     })?;
 
     Ok(())
 }
 
-pub(crate) fn remove<K: Pod>(map: &mut MapData, key: &K) -> Result<(), MapError> {
+pub(crate) fn remove<K: Pod>(map: &MapData, key: &K) -> Result<(), MapError> {
     let fd = map.fd_or_err()?;
     bpf_map_delete_elem(fd, key)
         .map(|_| ())
-        .map_err(|(_, io_error)| MapError::SyscallError {
-            call: "bpf_map_delete_elem",
-            io_error,
+        .map_err(|(_, io_error)| {
+            SyscallError {
+                call: "bpf_map_delete_elem",
+                io_error,
+            }
+            .into()
         })
 }

@@ -2,12 +2,13 @@
 use libc::pid_t;
 use object::{Object, ObjectSection, ObjectSymbol};
 use std::{
+    borrow::Cow,
     error::Error,
     ffi::CStr,
     fs,
     io::{self, BufRead, Cursor, Read},
     mem,
-    os::raw::c_char,
+    os::{fd::AsFd as _, raw::c_char},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -82,36 +83,7 @@ impl UProbe {
         target: T,
         pid: Option<pid_t>,
     ) -> Result<UProbeLinkId, ProgramError> {
-        let target = target.as_ref();
-        let target_str = &*target.as_os_str().to_string_lossy();
-
-        let mut path = if let Some(pid) = pid {
-            find_lib_in_proc_maps(pid, target_str).map_err(|io_error| UProbeError::FileError {
-                filename: format!("/proc/{pid}/maps"),
-                io_error,
-            })?
-        } else {
-            None
-        };
-
-        if path.is_none() {
-            path = if target.is_absolute() {
-                Some(target_str)
-            } else {
-                let cache =
-                    LD_SO_CACHE
-                        .as_ref()
-                        .map_err(|error| UProbeError::InvalidLdSoCache {
-                            io_error: error.clone(),
-                        })?;
-                cache.resolve(target_str)
-            }
-            .map(String::from)
-        };
-
-        let path = path.ok_or(UProbeError::InvalidTarget {
-            path: target.to_owned(),
-        })?;
+        let path = resolve_attach_path(&target, pid)?;
 
         let sym_offset = if let Some(fn_name) = fn_name {
             resolve_symbol(&path, fn_name).map_err(|error| UProbeError::SymbolError {
@@ -152,6 +124,59 @@ impl UProbe {
     }
 }
 
+fn resolve_attach_path<T: AsRef<Path>>(
+    target: &T,
+    pid: Option<pid_t>,
+) -> Result<Cow<'_, str>, UProbeError> {
+    // Look up the path for the target. If it there is a pid, and the target is a library name
+    // that is in the process's memory map, use the path of that library. Otherwise, use the target as-is.
+    let target = target.as_ref();
+    let invalid_target = || UProbeError::InvalidTarget {
+        path: target.to_owned(),
+    };
+    let target_str = target.to_str().ok_or_else(invalid_target)?;
+    pid.and_then(|pid| {
+        find_lib_in_proc_maps(pid, target_str)
+            .map_err(|io_error| UProbeError::FileError {
+                filename: format!("/proc/{pid}/maps"),
+                io_error,
+            })
+            .map(|v| v.map(Cow::Owned))
+            .transpose()
+    })
+    .or_else(|| target.is_absolute().then(|| Ok(Cow::Borrowed(target_str))))
+    .or_else(|| {
+        LD_SO_CACHE
+            .as_ref()
+            .map_err(|error| UProbeError::InvalidLdSoCache {
+                io_error: error.clone(),
+            })
+            .map(|cache| cache.resolve(target_str).map(Cow::Borrowed))
+            .transpose()
+    })
+    .unwrap_or_else(|| Err(invalid_target()))
+}
+
+// Only run this test on linux with glibc because only in that configuration do we know that we'll
+// be dynamically linked to libc and can exercise resolving the path to libc via the current
+// process's memory map.
+#[test]
+#[cfg_attr(
+    any(miri, not(all(target_os = "linux", target_env = "gnu"))),
+    ignore = "requires glibc, doesn't work in miri"
+)]
+fn test_resolve_attach_path() {
+    // Look up the current process's pid.
+    let pid = std::process::id().try_into().unwrap();
+
+    // Now let's resolve the path to libc. It should exist in the current process's memory map and
+    // then in the ld.so.cache.
+    let libc_path = resolve_attach_path(&"libc", Some(pid)).unwrap();
+
+    // Make sure we got a path that contains libc.
+    assert!(libc_path.contains("libc"), "libc_path: {}", libc_path);
+}
+
 define_link_wrapper!(
     /// The link used by [UProbe] programs.
     UProbeLink,
@@ -177,12 +202,7 @@ impl TryFrom<FdLink> for UProbeLink {
     type Error = LinkError;
 
     fn try_from(fd_link: FdLink) -> Result<Self, Self::Error> {
-        let info =
-            bpf_link_get_info_by_fd(fd_link.fd).map_err(|io_error| LinkError::SyscallError {
-                call: "BPF_OBJ_GET_INFO_BY_FD",
-                code: 0,
-                io_error,
-            })?;
+        let info = bpf_link_get_info_by_fd(fd_link.fd.as_fd())?;
         if info.type_ == (bpf_link_type::BPF_LINK_TYPE_TRACING as u32) {
             return Ok(UProbeLink::new(PerfLinkInner::FdLink(fd_link)));
         }
@@ -252,16 +272,16 @@ fn find_lib_in_proc_maps(pid: pid_t, lib: &str) -> Result<Option<String>, io::Er
     let libs = proc_maps_libs(pid)?;
 
     let ret = if lib.contains(".so") {
-        libs.iter().find(|(k, _)| k.as_str().starts_with(lib))
+        libs.into_iter().find(|(k, _)| k.as_str().starts_with(lib))
     } else {
-        let lib = lib.to_string();
-        let lib1 = lib.clone() + ".so";
-        let lib2 = lib + "-";
-        libs.iter()
-            .find(|(k, _)| k.starts_with(&lib1) || k.starts_with(&lib2))
+        libs.into_iter().find(|(k, _)| {
+            k.strip_prefix(lib)
+                .map(|k| k.starts_with(".so") || k.starts_with('-'))
+                .unwrap_or_default()
+        })
     };
 
-    Ok(ret.map(|(_, v)| v.clone()))
+    Ok(ret.map(|(_, v)| v))
 }
 
 #[derive(Debug)]
@@ -337,33 +357,34 @@ impl LdSoCache {
             0
         };
 
-        let mut entries = Vec::new();
-        for _ in 0..num_entries {
-            let flags = read_i32(&mut cursor)?;
-            let k_pos = read_u32(&mut cursor)? as usize;
-            let v_pos = read_u32(&mut cursor)? as usize;
+        let entries = (0..num_entries)
+            .map(|_: u32| {
+                let flags = read_i32(&mut cursor)?;
+                let k_pos = read_u32(&mut cursor)? as usize;
+                let v_pos = read_u32(&mut cursor)? as usize;
 
-            if new_format {
-                cursor.consume(12);
-            }
+                if new_format {
+                    cursor.consume(12);
+                }
 
-            let key = unsafe {
-                CStr::from_ptr(cursor.get_ref()[offset + k_pos..].as_ptr() as *const c_char)
-            }
-            .to_string_lossy()
-            .into_owned();
-            let value = unsafe {
-                CStr::from_ptr(cursor.get_ref()[offset + v_pos..].as_ptr() as *const c_char)
-            }
-            .to_string_lossy()
-            .into_owned();
+                let read_str = |pos| {
+                    unsafe {
+                        CStr::from_ptr(cursor.get_ref()[offset + pos..].as_ptr() as *const c_char)
+                    }
+                    .to_string_lossy()
+                    .into_owned()
+                };
 
-            entries.push(CacheEntry {
-                key,
-                value,
-                _flags: flags,
-            });
-        }
+                let key = read_str(k_pos);
+                let value = read_str(v_pos);
+
+                Ok::<_, io::Error>(CacheEntry {
+                    key,
+                    value,
+                    _flags: flags,
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         Ok(LdSoCache { entries })
     }

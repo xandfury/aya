@@ -1,17 +1,14 @@
 //! Cgroup sysctl programs.
 
 use crate::util::KernelVersion;
-use std::{
-    hash::Hash,
-    os::fd::{AsRawFd, RawFd},
-};
+use std::{hash::Hash, os::fd::AsRawFd};
 
 use crate::{
     generated::{bpf_attach_type::BPF_CGROUP_SYSCTL, bpf_prog_type::BPF_PROG_TYPE_CGROUP_SYSCTL},
     programs::{
         define_link_wrapper, load_program, FdLink, Link, ProgAttachLink, ProgramData, ProgramError,
     },
-    sys::{bpf_link_create, bpf_prog_attach},
+    sys::{bpf_link_create, bpf_prog_attach, SyscallError},
 };
 
 /// A program used to watch for sysctl changes.
@@ -68,11 +65,11 @@ impl CgroupSysctl {
 
         if KernelVersion::current().unwrap() >= KernelVersion::new(5, 7, 0) {
             let link_fd = bpf_link_create(prog_fd, cgroup_fd, BPF_CGROUP_SYSCTL, None, 0).map_err(
-                |(_, io_error)| ProgramError::SyscallError {
+                |(_, io_error)| SyscallError {
                     call: "bpf_link_create",
                     io_error,
                 },
-            )? as RawFd;
+            )?;
             self.data
                 .links
                 .insert(CgroupSysctlLink::new(CgroupSysctlLinkInner::Fd(
@@ -80,7 +77,7 @@ impl CgroupSysctl {
                 )))
         } else {
             bpf_prog_attach(prog_fd, cgroup_fd, BPF_CGROUP_SYSCTL).map_err(|(_, io_error)| {
-                ProgramError::SyscallError {
+                SyscallError {
                     call: "bpf_prog_attach",
                     io_error,
                 }

@@ -1,11 +1,16 @@
 //! A hash map of kernel or user space stack traces.
 //!
 //! See [`StackTraceMap`] for documentation and examples.
-use std::{borrow::Borrow, collections::BTreeMap, fs, io, mem, path::Path, str::FromStr};
+use std::{
+    borrow::{Borrow, Cow},
+    fs, io, mem,
+    path::Path,
+    str::FromStr,
+};
 
 use crate::{
     maps::{IterableMap, MapData, MapError, MapIter, MapKeys},
-    sys::bpf_map_lookup_elem_ptr,
+    sys::{bpf_map_lookup_elem_ptr, SyscallError},
 };
 
 /// A hash map of kernel or user space stack traces.
@@ -77,11 +82,9 @@ impl<T: Borrow<MapData>> StackTraceMap<T> {
         }
 
         let max_stack_depth =
-            sysctl::<usize>("kernel/perf_event_max_stack").map_err(|io_error| {
-                MapError::SyscallError {
-                    call: "sysctl",
-                    io_error,
-                }
+            sysctl::<usize>("kernel/perf_event_max_stack").map_err(|io_error| SyscallError {
+                call: "sysctl",
+                io_error,
             })?;
         let size = data.obj.value_size() as usize;
         if size > max_stack_depth * mem::size_of::<u64>() {
@@ -106,7 +109,7 @@ impl<T: Borrow<MapData>> StackTraceMap<T> {
 
         let mut frames = vec![0; self.max_stack_depth];
         bpf_map_lookup_elem_ptr(fd, Some(stack_id), frames.as_mut_ptr(), flags)
-            .map_err(|(_, io_error)| MapError::SyscallError {
+            .map_err(|(_, io_error)| SyscallError {
                 call: "bpf_map_lookup_elem",
                 io_error,
             })?
@@ -159,6 +162,12 @@ impl<'a, T: Borrow<MapData>> IntoIterator for &'a StackTraceMap<T> {
     }
 }
 
+/// A resolver for symbols based on an address obtained from a stack trace.
+pub trait SymbolResolver {
+    /// Resolve a symbol for a given address, if possible.
+    fn resolve_symbol(&self, addr: u64) -> Option<Cow<'_, str>>;
+}
+
 /// A kernel or user space stack trace.
 ///
 /// See the [`StackTraceMap`] documentation for examples.
@@ -174,12 +183,9 @@ impl StackTrace {
     /// You can use [`util::kernel_symbols()`](crate::util::kernel_symbols) to load kernel symbols. For
     /// user-space traces you need to provide the symbols, for example loading
     /// them from debug info.
-    pub fn resolve(&mut self, symbols: &BTreeMap<u64, String>) -> &StackTrace {
+    pub fn resolve<R: SymbolResolver>(&mut self, symbols: &R) -> &StackTrace {
         for frame in self.frames.iter_mut() {
-            frame.symbol_name = symbols
-                .range(..=frame.ip)
-                .next_back()
-                .map(|(_, s)| s.clone())
+            frame.symbol_name = symbols.resolve_symbol(frame.ip).map(|s| s.into_owned())
         }
 
         self

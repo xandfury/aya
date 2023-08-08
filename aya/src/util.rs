@@ -1,5 +1,6 @@
 //! Utility functions.
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     error::Error,
     ffi::{CStr, CString},
@@ -11,6 +12,7 @@ use std::{
 
 use crate::{
     generated::{TC_H_MAJ_MASK, TC_H_MIN_MASK},
+    maps::stack_trace::SymbolResolver,
     Pod,
 };
 
@@ -25,18 +27,14 @@ pub struct KernelVersion {
     pub(crate) patch: u16,
 }
 
-/// An error encountered while fetching the current kernel version.
 #[derive(thiserror::Error, Debug)]
-pub enum CurrentKernelVersionError {
-    /// The kernel version string could not be read.
+enum CurrentKernelVersionError {
     #[error("failed to read kernel version")]
-    IOError(#[from] io::Error),
-    /// The kernel version string could not be parsed.
+    IO(#[from] io::Error),
     #[error("failed to parse kernel version")]
-    ParseError(#[from] text_io::Error),
-    /// The kernel version string was not valid UTF-8.
+    ParseError(String),
     #[error("kernel version string is not valid UTF-8")]
-    Utf8Error(#[from] Utf8Error),
+    Utf8(#[from] Utf8Error),
 }
 
 impl KernelVersion {
@@ -74,7 +72,7 @@ impl KernelVersion {
 
     fn get_ubuntu_kernel_version() -> Result<Option<Self>, CurrentKernelVersionError> {
         const UBUNTU_KVER_FILE: &str = "/proc/version_signature";
-        let s = match fs::read(UBUNTU_KVER_FILE) {
+        let s = match fs::read_to_string(UBUNTU_KVER_FILE) {
             Ok(s) => s,
             Err(e) => {
                 if e.kind() == io::ErrorKind::NotFound {
@@ -83,13 +81,16 @@ impl KernelVersion {
                 return Err(e.into());
             }
         };
-        let ubuntu: String;
-        let ubuntu_version: String;
-        let major: u8;
-        let minor: u8;
-        let patch: u16;
-        text_io::try_scan!(s.iter().copied() => "{} {} {}.{}.{}\n", ubuntu, ubuntu_version, major, minor, patch);
-        Ok(Some(Self::new(major, minor, patch)))
+        let mut parts = s.split_terminator(char::is_whitespace);
+        let mut next = || {
+            parts
+                .next()
+                .ok_or_else(|| CurrentKernelVersionError::ParseError(s.to_string()))
+        };
+        let _ubuntu: &str = next()?;
+        let _ubuntu_version: &str = next()?;
+        let kernel_version_string = next()?;
+        Self::parse_kernel_version_string(kernel_version_string).map(Some)
     }
 
     fn get_debian_kernel_version(
@@ -99,17 +100,13 @@ impl KernelVersion {
         //
         // The length of the arrays in a struct utsname is unspecified (see NOTES); the fields are
         // terminated by a null byte ('\0').
-        let p = unsafe { CStr::from_ptr(info.version.as_ptr()) };
-        let p = p.to_str()?;
-        let p = match p.split_once("Debian ") {
+        let s = unsafe { CStr::from_ptr(info.version.as_ptr()) };
+        let s = s.to_str()?;
+        let kernel_version_string = match s.split_once("Debian ") {
             Some((_prefix, suffix)) => suffix,
             None => return Ok(None),
         };
-        let major: u8;
-        let minor: u8;
-        let patch: u16;
-        text_io::try_scan!(p.bytes() => "{}.{}.{}", major, minor, patch);
-        Ok(Some(Self::new(major, minor, patch)))
+        Self::parse_kernel_version_string(kernel_version_string).map(Some)
     }
 
     fn get_kernel_version() -> Result<Self, CurrentKernelVersionError> {
@@ -130,17 +127,23 @@ impl KernelVersion {
         //
         // The length of the arrays in a struct utsname is unspecified (see NOTES); the fields are
         // terminated by a null byte ('\0').
-        let p = unsafe { CStr::from_ptr(info.release.as_ptr()) };
-        let p = p.to_str()?;
-        // Unlike sscanf, text_io::try_scan! does not stop at the first non-matching character.
-        let p = match p.split_once(|c: char| c != '.' && !c.is_ascii_digit()) {
-            Some((prefix, _suffix)) => prefix,
-            None => p,
-        };
-        let major: u8;
-        let minor: u8;
-        let patch: u16;
-        text_io::try_scan!(p.bytes() => "{}.{}.{}", major, minor, patch);
+        let s = unsafe { CStr::from_ptr(info.release.as_ptr()) };
+        let s = s.to_str()?;
+        Self::parse_kernel_version_string(s)
+    }
+
+    fn parse_kernel_version_string(s: &str) -> Result<Self, CurrentKernelVersionError> {
+        fn parse<T: FromStr<Err = std::num::ParseIntError>>(s: Option<&str>) -> Option<T> {
+            match s.map(str::parse).transpose() {
+                Ok(option) => option,
+                Err(std::num::ParseIntError { .. }) => None,
+            }
+        }
+        let error = || CurrentKernelVersionError::ParseError(s.to_string());
+        let mut parts = s.split(|c: char| c == '.' || !c.is_ascii_digit());
+        let major = parse(parts.next()).ok_or_else(error)?;
+        let minor = parse(parts.next()).ok_or_else(error)?;
+        let patch = parse(parts.next()).ok_or_else(error)?;
         Ok(Self::new(major, minor, patch))
     }
 }
@@ -200,16 +203,25 @@ fn parse_cpu_ranges(data: &str) -> Result<Vec<u32>, ()> {
     Ok(cpus)
 }
 
+/// The simplest resolver: a direct map from addresses to strings.
+pub type SimpleSymbolResolver = BTreeMap<u64, String>;
+
+impl SymbolResolver for SimpleSymbolResolver {
+    fn resolve_symbol(&self, addr: u64) -> Option<Cow<'_, str>> {
+        self.range(..=addr).next_back().map(|(_, s)| s.into())
+    }
+}
+
 /// Loads kernel symbols from `/proc/kallsyms`.
 ///
 /// The symbols can be passed to [`StackTrace::resolve`](crate::maps::stack_trace::StackTrace::resolve).
-pub fn kernel_symbols() -> Result<BTreeMap<u64, String>, io::Error> {
+pub fn kernel_symbols() -> Result<SimpleSymbolResolver, io::Error> {
     let mut reader = BufReader::new(File::open("/proc/kallsyms")?);
     parse_kernel_symbols(&mut reader)
 }
 
-fn parse_kernel_symbols(reader: impl BufRead) -> Result<BTreeMap<u64, String>, io::Error> {
-    let mut syms = BTreeMap::new();
+fn parse_kernel_symbols(reader: impl BufRead) -> Result<SimpleSymbolResolver, io::Error> {
+    let mut syms = SimpleSymbolResolver::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -331,6 +343,19 @@ pub(crate) fn bytes_of_slice<T: Pod>(val: &[T]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_matches::assert_matches;
+
+    #[test]
+    fn test_parse_kernel_version_string() {
+        // WSL.
+        assert_matches!(KernelVersion::parse_kernel_version_string("5.15.90.1-microsoft-standard-WSL2"), Ok(kernel_version) => {
+            assert_eq!(kernel_version, KernelVersion::new(5, 15, 90))
+        });
+        // uname -r on Fedora.
+        assert_matches!(KernelVersion::parse_kernel_version_string("6.3.11-200.fc38.x86_64"), Ok(kernel_version) => {
+            assert_eq!(kernel_version, KernelVersion::new(6, 3, 11))
+        });
+    }
 
     #[test]
     fn test_parse_online_cpus() {

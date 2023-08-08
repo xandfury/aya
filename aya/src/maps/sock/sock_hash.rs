@@ -1,14 +1,14 @@
 use std::{
     borrow::{Borrow, BorrowMut},
     marker::PhantomData,
-    os::unix::io::{AsRawFd, RawFd},
+    os::fd::{AsRawFd, RawFd},
 };
 
 use crate::{
     maps::{
         check_kv_size, hash_map, sock::SockMapFd, IterableMap, MapData, MapError, MapIter, MapKeys,
     },
-    sys::bpf_map_lookup_elem,
+    sys::{bpf_map_lookup_elem, SyscallError},
     Pod,
 };
 
@@ -42,7 +42,7 @@ use crate::{
 /// # let mut bpf = aya::Bpf::load(&[])?;
 /// use std::io::Write;
 /// use std::net::TcpStream;
-/// use std::os::unix::io::AsRawFd;
+/// use std::os::fd::AsRawFd;
 /// use aya::maps::SockHash;
 /// use aya::programs::SkMsg;
 ///
@@ -83,11 +83,9 @@ impl<T: Borrow<MapData>, K: Pod> SockHash<T, K> {
     /// Returns the fd of the socket stored at the given key.
     pub fn get(&self, key: &K, flags: u64) -> Result<RawFd, MapError> {
         let fd = self.inner.borrow().fd_or_err()?;
-        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(_, io_error)| {
-            MapError::SyscallError {
-                call: "bpf_map_lookup_elem",
-                io_error,
-            }
+        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(_, io_error)| SyscallError {
+            call: "bpf_map_lookup_elem",
+            io_error,
         })?;
         value.ok_or(MapError::KeyNotFound)
     }

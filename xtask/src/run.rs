@@ -1,22 +1,21 @@
 use std::{
+    ffi::OsString,
     fmt::Write as _,
     io::BufReader,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use cargo_metadata::{Artifact, CompilerMessage, Message, Target};
 use clap::Parser;
+use xtask::AYA_BUILD_INTEGRATION_BPF;
 
 #[derive(Debug, Parser)]
 pub struct BuildOptions {
-    /// Pass --release to `cargo build`.
+    /// Arguments to pass to `cargo build`.
     #[clap(long)]
-    pub release: bool,
-    /// Pass --target to `cargo build`.
-    #[clap(long)]
-    pub target: Option<String>,
+    pub cargo_arg: Vec<OsString>,
 }
 
 #[derive(Debug, Parser)]
@@ -27,35 +26,33 @@ pub struct Options {
     #[clap(short, long, default_value = "sudo -E")]
     pub runner: String,
     /// Arguments to pass to your application.
-    #[clap(name = "args", last = true)]
-    pub run_args: Vec<String>,
+    #[clap(last = true)]
+    pub run_args: Vec<OsString>,
 }
 
 /// Build the project
 pub fn build(opts: BuildOptions) -> Result<Vec<(String, PathBuf)>> {
-    let BuildOptions { release, target } = opts;
+    let BuildOptions { cargo_arg } = opts;
     let mut cmd = Command::new("cargo");
-    cmd.env("AYA_BUILD_INTEGRATION_BPF", "true").args([
-        "build",
-        "--tests",
-        "--message-format=json",
-        "--package=integration-test",
-    ]);
-    if release {
-        cmd.arg("--release");
-    }
-    if let Some(target) = target {
-        cmd.args(["--target", &target]);
-    }
-    let mut cmd = cmd
+    cmd.env(AYA_BUILD_INTEGRATION_BPF, "true")
+        .args([
+            "build",
+            "--tests",
+            "--message-format=json",
+            "--package=integration-test",
+        ])
+        .args(cargo_arg);
+
+    let mut child = cmd
         .stdout(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn {cmd:?}"))?;
+    let Child { stdout, .. } = &mut child;
 
-    let reader = BufReader::new(cmd.stdout.take().unwrap());
+    let stdout = stdout.take().unwrap();
+    let stdout = BufReader::new(stdout);
     let mut executables = Vec::new();
-    let mut compiler_messages = String::new();
-    for message in Message::parse_stream(reader) {
+    for message in Message::parse_stream(stdout) {
         #[allow(clippy::collapsible_match)]
         match message.context("valid JSON")? {
             Message::CompilerArtifact(Artifact {
@@ -68,26 +65,27 @@ pub fn build(opts: BuildOptions) -> Result<Vec<(String, PathBuf)>> {
                 }
             }
             Message::CompilerMessage(CompilerMessage { message, .. }) => {
-                writeln!(&mut compiler_messages, "{message}").context("String write failed")?
+                println!("{message}");
             }
-
+            Message::TextLine(line) => {
+                println!("{line}");
+            }
             _ => {}
         }
     }
 
-    let status = cmd
+    let status = child
         .wait()
         .with_context(|| format!("failed to wait for {cmd:?}"))?;
-
     match status.code() {
         Some(code) => match code {
-            0 => Ok(executables),
-            code => Err(anyhow::anyhow!(
-                "{cmd:?} exited with status code {code}:\n{compiler_messages}"
-            )),
+            0 => {}
+            code => bail!("{cmd:?} exited with status code {code}"),
         },
-        None => Err(anyhow::anyhow!("{cmd:?} terminated by signal")),
+        None => bail!("{cmd:?} terminated by signal"),
     }
+
+    Ok(executables)
 }
 
 /// Build and run the project

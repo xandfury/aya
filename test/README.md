@@ -10,15 +10,11 @@ common usage behaviours work on real Linux distros
 To run locally all you need is:
 
 1. Rust nightly
-2. `libelf`
-3. A checkout of [libbpf](https://github.com/libbpf/libbpf)
-4. `cargo install bpf-linker`
-5. `bpftool`
+1. `cargo install bpf-linker`
 
 ### Other OSs
 
 1. A POSIX shell
-1. A checkout of [libbpf](https://github.com/libbpf/libbpf)
 1. `rustup target add x86_64-unknown-linux-musl`
 1. `cargo install bpf-linker`
 1. Install `qemu` and `cloud-init-utils` package - or any package that provides `cloud-localds`
@@ -36,7 +32,9 @@ cargo xtask integration-test
 ### Virtualized
 
 ```
-./test/run.sh
+mkdir -p integration-test-binaries
+cargo xtask build-integration-test | xargs -I % cp % integration-test-binaries
+./test/run.sh integration-test-binaries
 ```
 
 ### Writing an integration test

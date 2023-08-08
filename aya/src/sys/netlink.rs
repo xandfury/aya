@@ -1,11 +1,11 @@
-use std::{collections::HashMap, ffi::CStr, io, mem, os::unix::io::RawFd, ptr, slice};
+use std::{collections::HashMap, ffi::CStr, io, mem, os::fd::RawFd, ptr, slice};
 use thiserror::Error;
 
 use libc::{
     close, getsockname, nlattr, nlmsgerr, nlmsghdr, recv, send, setsockopt, sockaddr_nl, socket,
-    AF_NETLINK, AF_UNSPEC, ETH_P_ALL, IFLA_XDP, NETLINK_EXT_ACK, NETLINK_ROUTE, NLA_ALIGNTO,
-    NLA_F_NESTED, NLA_TYPE_MASK, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP,
-    NLM_F_ECHO, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REQUEST, RTM_DELTFILTER, RTM_GETTFILTER,
+    AF_NETLINK, AF_UNSPEC, ETH_P_ALL, IFF_UP, IFLA_XDP, NETLINK_EXT_ACK, NETLINK_ROUTE,
+    NLA_ALIGNTO, NLA_F_NESTED, NLA_TYPE_MASK, NLMSG_DONE, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE,
+    NLM_F_DUMP, NLM_F_ECHO, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REQUEST, RTM_DELTFILTER, RTM_GETTFILTER,
     RTM_NEWQDISC, RTM_NEWTFILTER, RTM_SETLINK, SOCK_RAW, SOL_NETLINK,
 };
 
@@ -238,6 +238,32 @@ pub(crate) unsafe fn netlink_find_filter_with_name(
     }
 
     Ok(filter_info)
+}
+
+#[doc(hidden)]
+pub unsafe fn netlink_set_link_up(if_index: i32) -> Result<(), io::Error> {
+    let sock = NetlinkSocket::open()?;
+
+    // Safety: Request is POD so this is safe
+    let mut req = mem::zeroed::<Request>();
+
+    let nlmsg_len = mem::size_of::<nlmsghdr>() + mem::size_of::<ifinfomsg>();
+    req.header = nlmsghdr {
+        nlmsg_len: nlmsg_len as u32,
+        nlmsg_flags: (NLM_F_REQUEST | NLM_F_ACK) as u16,
+        nlmsg_type: RTM_SETLINK,
+        nlmsg_pid: 0,
+        nlmsg_seq: 1,
+    };
+    req.if_info.ifi_family = AF_UNSPEC as u8;
+    req.if_info.ifi_index = if_index;
+    req.if_info.ifi_flags = IFF_UP as u32;
+    req.if_info.ifi_change = IFF_UP as u32;
+
+    sock.send(&bytes_of(&req)[..req.header.nlmsg_len as usize])?;
+    sock.recv()?;
+
+    Ok(())
 }
 
 #[repr(C)]
@@ -575,8 +601,8 @@ impl From<NlAttrError> for io::Error {
 }
 
 unsafe fn request_attributes<T>(req: &mut T, msg_len: usize) -> &mut [u8] {
-    let attrs_addr = align_to(req as *const _ as usize + msg_len, NLMSG_ALIGNTO as usize);
-    let attrs_end = req as *const _ as usize + mem::size_of::<T>();
+    let attrs_addr = align_to(req as *mut _ as usize + msg_len, NLMSG_ALIGNTO as usize);
+    let attrs_end = req as *mut _ as usize + mem::size_of::<T>();
     slice::from_raw_parts_mut(attrs_addr as *mut u8, attrs_end - attrs_addr)
 }
 

@@ -93,10 +93,11 @@ fn set_kernel_buffer_element(bpf: &mut Bpf, bytes: &[u8]) {
     m.set(0, bytes, 0).unwrap();
 }
 
+#[track_caller]
 fn result_bytes(bpf: &Bpf) -> Vec<u8> {
     let m = Array::<_, TestResult>::try_from(bpf.map("RESULT").unwrap()).unwrap();
     let result = m.get(&0, 0).unwrap();
-    assert!(result.did_error == 0);
+    assert_eq!(result.did_error, 0);
     // assert that the buffer is always null terminated
     assert_eq!(result.buf[result.len], 0);
     result.buf[..result.len].to_vec()
@@ -116,8 +117,12 @@ fn load_and_attach_uprobe(prog_name: &str, func_name: &str, bytes: &[u8]) -> Bpf
 
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn trigger_bpf_probe_read_user(_string: *const u8, _len: usize) {}
+pub extern "C" fn trigger_bpf_probe_read_user(string: *const u8, len: usize) {
+    core::hint::black_box((string, len));
+}
 
 #[no_mangle]
 #[inline(never)]
-pub extern "C" fn trigger_bpf_probe_read_kernel(_len: usize) {}
+pub extern "C" fn trigger_bpf_probe_read_kernel(len: usize) {
+    core::hint::black_box(len);
+}
