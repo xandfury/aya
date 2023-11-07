@@ -6,6 +6,7 @@ use std::{
 use aya::{programs::UProbe, Bpf};
 use aya_log::BpfLogger;
 use log::{Level, Log, Record};
+use test_log::test;
 
 #[no_mangle]
 #[inline(never)]
@@ -37,7 +38,7 @@ struct CapturedLog<'a> {
     pub target: Cow<'a, str>,
 }
 
-#[tokio::test]
+#[test(tokio::test)]
 async fn log() {
     let mut bpf = Bpf::load(crate::LOG).unwrap();
 
@@ -70,12 +71,16 @@ async fn log() {
 
     let mut logs = 0;
     let records = loop {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let records = captured_logs.lock().unwrap();
-        if records.len() == logs {
+        let len = records.len();
+        if len == 0 {
+            continue;
+        }
+        if len == logs {
             break records;
         }
-        logs = records.len();
+        logs = len;
     };
 
     let mut records = records.iter();
@@ -92,7 +97,7 @@ async fn log() {
     assert_eq!(
         records.next(),
         Some(&CapturedLog {
-            body: "69, 420, wao".into(),
+            body: "69, 420, wao, 77616f".into(),
             level: Level::Error,
             target: "log".into(),
         })
@@ -129,6 +134,15 @@ async fn log() {
         records.next(),
         Some(&CapturedLog {
             body: "hex lc: deadbeef, hex uc: DEADBEEF".into(),
+            level: Level::Debug,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: "42 43 44 45".into(),
             level: Level::Debug,
             target: "log".into(),
         })

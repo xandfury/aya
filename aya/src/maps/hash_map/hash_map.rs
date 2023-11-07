@@ -1,6 +1,7 @@
 use std::{
     borrow::{Borrow, BorrowMut},
     marker::PhantomData,
+    os::fd::AsFd as _,
 };
 
 use crate::{
@@ -33,18 +34,17 @@ use crate::{
 #[doc(alias = "BPF_MAP_TYPE_LRU_HASH")]
 #[derive(Debug)]
 pub struct HashMap<T, K, V> {
-    inner: T,
+    pub(crate) inner: T,
     _k: PhantomData<K>,
     _v: PhantomData<V>,
 }
 
 impl<T: Borrow<MapData>, K: Pod, V: Pod> HashMap<T, K, V> {
-    pub(crate) fn new(map: T) -> Result<HashMap<T, K, V>, MapError> {
+    pub(crate) fn new(map: T) -> Result<Self, MapError> {
         let data = map.borrow();
         check_kv_size::<K, V>(data)?;
-        let _ = data.fd_or_err()?;
 
-        Ok(HashMap {
+        Ok(Self {
             inner: map,
             _k: PhantomData,
             _v: PhantomData,
@@ -53,7 +53,7 @@ impl<T: Borrow<MapData>, K: Pod, V: Pod> HashMap<T, K, V> {
 
     /// Returns a copy of the value associated with the key.
     pub fn get(&self, key: &K, flags: u64) -> Result<V, MapError> {
-        let fd = self.inner.borrow().fd_or_err()?;
+        let fd = self.inner.borrow().fd().as_fd();
         let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(_, io_error)| SyscallError {
             call: "bpf_map_lookup_elem",
             io_error,
@@ -97,7 +97,7 @@ impl<T: Borrow<MapData>, K: Pod, V: Pod> IterableMap<K, V> for HashMap<T, K, V> 
     }
 
     fn get(&self, key: &K) -> Result<V, MapError> {
-        HashMap::get(self, key, 0)
+        Self::get(self, key, 0)
     }
 }
 
@@ -108,33 +108,22 @@ mod tests {
     use assert_matches::assert_matches;
     use libc::{EFAULT, ENOENT};
 
+    use super::{
+        super::test_utils::{self, new_map},
+        *,
+    };
     use crate::{
-        bpf_map_def,
         generated::{
             bpf_attr, bpf_cmd,
             bpf_map_type::{BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH},
         },
-        maps::{Map, MapData},
-        obj::{self, maps::LegacyMap, BpfSectionKind},
+        maps::Map,
+        obj,
         sys::{override_syscall, SysResult, Syscall},
     };
 
-    use super::*;
-
     fn new_obj_map() -> obj::Map {
-        obj::Map::Legacy(LegacyMap {
-            def: bpf_map_def {
-                map_type: BPF_MAP_TYPE_HASH as u32,
-                key_size: 4,
-                value_size: 4,
-                max_entries: 1024,
-                ..Default::default()
-            },
-            section_index: 0,
-            section_kind: BpfSectionKind::Maps,
-            data: Vec::new(),
-            symbol_index: None,
-        })
+        test_utils::new_obj_map(BPF_MAP_TYPE_HASH)
     }
 
     fn sys_error(value: i32) -> SysResult<c_long> {
@@ -143,12 +132,7 @@ mod tests {
 
     #[test]
     fn test_wrong_key_size() {
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: None,
-            pinned: false,
-            btf_fd: None,
-        };
+        let map = new_map(new_obj_map());
         assert_matches!(
             HashMap::<_, u8, u32>::new(&map),
             Err(MapError::InvalidKeySize {
@@ -160,12 +144,7 @@ mod tests {
 
     #[test]
     fn test_wrong_value_size() {
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: None,
-            pinned: false,
-            btf_fd: None,
-        };
+        let map = new_map(new_obj_map());
         assert_matches!(
             HashMap::<_, u32, u16>::new(&map),
             Err(MapError::InvalidValueSize {
@@ -177,14 +156,8 @@ mod tests {
 
     #[test]
     fn test_try_from_wrong_map() {
-        let map_data = MapData {
-            obj: new_obj_map(),
-            fd: None,
-            pinned: false,
-            btf_fd: None,
-        };
-
-        let map = Map::Array(map_data);
+        let map = new_map(new_obj_map());
+        let map = Map::Array(map);
         assert_matches!(
             HashMap::<_, u8, u32>::try_from(&map),
             Err(MapError::InvalidMapType { .. })
@@ -193,14 +166,8 @@ mod tests {
 
     #[test]
     fn test_try_from_wrong_map_values() {
-        let map_data = MapData {
-            obj: new_obj_map(),
-            fd: None,
-            pinned: false,
-            btf_fd: None,
-        };
-
-        let map = Map::HashMap(map_data);
+        let map = new_map(new_obj_map());
+        let map = Map::HashMap(map);
         assert_matches!(
             HashMap::<_, u32, u16>::try_from(&map),
             Err(MapError::InvalidValueSize {
@@ -211,82 +178,33 @@ mod tests {
     }
 
     #[test]
-    fn test_new_not_created() {
-        let mut map = MapData {
-            obj: new_obj_map(),
-            fd: None,
-            pinned: false,
-            btf_fd: None,
-        };
-
-        assert_matches!(
-            HashMap::<_, u32, u32>::new(&mut map),
-            Err(MapError::NotCreated { .. })
-        );
-    }
-
-    #[test]
     fn test_new_ok() {
-        let mut map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
-
-        assert!(HashMap::<_, u32, u32>::new(&mut map).is_ok());
+        let map = new_map(new_obj_map());
+        assert!(HashMap::<_, u32, u32>::new(&map).is_ok());
     }
 
     #[test]
     fn test_try_from_ok() {
-        let map_data = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
-
-        let map = Map::HashMap(map_data);
+        let map = new_map(new_obj_map());
+        let map = Map::HashMap(map);
         assert!(HashMap::<_, u32, u32>::try_from(&map).is_ok())
     }
 
     #[test]
     fn test_try_from_ok_lru() {
-        let map_data = MapData {
-            obj: obj::Map::Legacy(LegacyMap {
-                def: bpf_map_def {
-                    map_type: BPF_MAP_TYPE_LRU_HASH as u32,
-                    key_size: 4,
-                    value_size: 4,
-                    max_entries: 1024,
-                    ..Default::default()
-                },
-                section_index: 0,
-                section_kind: BpfSectionKind::Maps,
-                symbol_index: None,
-                data: Vec::new(),
-            }),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
-
-        let map = Map::HashMap(map_data);
-
+        let map_data = || new_map(test_utils::new_obj_map(BPF_MAP_TYPE_LRU_HASH));
+        let map = Map::HashMap(map_data());
+        assert!(HashMap::<_, u32, u32>::try_from(&map).is_ok());
+        let map = Map::LruHashMap(map_data());
         assert!(HashMap::<_, u32, u32>::try_from(&map).is_ok())
     }
 
     #[test]
     fn test_insert_syscall_error() {
-        override_syscall(|_| sys_error(EFAULT));
-
-        let mut map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
+        let mut map = new_map(new_obj_map());
         let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
+
+        override_syscall(|_| sys_error(EFAULT));
 
         assert_matches!(
             hm.insert(1, 42, 0),
@@ -296,6 +214,9 @@ mod tests {
 
     #[test]
     fn test_insert_ok() {
+        let mut map = new_map(new_obj_map());
+        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
+
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_UPDATE_ELEM,
@@ -303,20 +224,15 @@ mod tests {
             } => Ok(1),
             _ => sys_error(EFAULT),
         });
-
-        let mut map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
-        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
 
         assert!(hm.insert(1, 42, 0).is_ok());
     }
 
     #[test]
     fn test_insert_boxed_ok() {
+        let mut map = new_map(new_obj_map());
+        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
+
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_UPDATE_ELEM,
@@ -325,28 +241,15 @@ mod tests {
             _ => sys_error(EFAULT),
         });
 
-        let mut map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
-        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
-
         assert!(hm.insert(Box::new(1), Box::new(42), 0).is_ok());
     }
 
     #[test]
     fn test_remove_syscall_error() {
-        override_syscall(|_| sys_error(EFAULT));
-
-        let mut map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
+        let mut map = new_map(new_obj_map());
         let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
+
+        override_syscall(|_| sys_error(EFAULT));
 
         assert_matches!(
             hm.remove(&1),
@@ -356,6 +259,9 @@ mod tests {
 
     #[test]
     fn test_remove_ok() {
+        let mut map = new_map(new_obj_map());
+        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
+
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_DELETE_ELEM,
@@ -364,26 +270,13 @@ mod tests {
             _ => sys_error(EFAULT),
         });
 
-        let mut map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
-        let mut hm = HashMap::<_, u32, u32>::new(&mut map).unwrap();
-
         assert!(hm.remove(&1).is_ok());
     }
 
     #[test]
     fn test_get_syscall_error() {
+        let map = new_map(new_obj_map());
         override_syscall(|_| sys_error(EFAULT));
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
         assert_matches!(
@@ -394,6 +287,7 @@ mod tests {
 
     #[test]
     fn test_get_not_found() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_LOOKUP_ELEM,
@@ -401,12 +295,6 @@ mod tests {
             } => sys_error(ENOENT),
             _ => sys_error(EFAULT),
         });
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
         assert_matches!(hm.get(&1, 0), Err(MapError::KeyNotFound));
@@ -431,6 +319,7 @@ mod tests {
 
     #[test]
     fn test_keys_empty() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -438,12 +327,6 @@ mod tests {
             } => sys_error(ENOENT),
             _ => sys_error(EFAULT),
         });
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
         let keys = hm.keys().collect::<Result<Vec<_>, _>>();
         assert_matches!(keys, Ok(ks) if ks.is_empty())
@@ -479,6 +362,8 @@ mod tests {
     // to support stable as well.
     #[cfg_attr(miri, ignore)]
     fn test_keys() {
+        let map = new_map(new_obj_map());
+
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -487,12 +372,6 @@ mod tests {
             _ => sys_error(EFAULT),
         });
 
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
         let keys = hm.keys().collect::<Result<Vec<_>, _>>().unwrap();
@@ -505,6 +384,7 @@ mod tests {
     // to support stable as well.
     #[cfg_attr(miri, ignore)]
     fn test_keys_error() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -520,12 +400,6 @@ mod tests {
             }
             _ => sys_error(EFAULT),
         });
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
         let mut keys = hm.keys();
@@ -547,6 +421,7 @@ mod tests {
     // to support stable as well.
     #[cfg_attr(miri, ignore)]
     fn test_iter() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -558,12 +433,6 @@ mod tests {
             } => lookup_elem(attr),
             _ => sys_error(EFAULT),
         });
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
         let items = hm.iter().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(&items, &[(10, 100), (20, 200), (30, 300)])
@@ -575,6 +444,7 @@ mod tests {
     // to support stable as well.
     #[cfg_attr(miri, ignore)]
     fn test_iter_key_deleted() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -596,12 +466,6 @@ mod tests {
             }
             _ => sys_error(EFAULT),
         });
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
         let items = hm.iter().collect::<Result<Vec<_>, _>>().unwrap();
@@ -614,6 +478,7 @@ mod tests {
     // to support stable as well.
     #[cfg_attr(miri, ignore)]
     fn test_iter_key_error() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -635,12 +500,6 @@ mod tests {
             } => lookup_elem(attr),
             _ => sys_error(EFAULT),
         });
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
         let mut iter = hm.iter();
@@ -662,6 +521,7 @@ mod tests {
     // to support stable as well.
     #[cfg_attr(miri, ignore)]
     fn test_iter_value_error() {
+        let map = new_map(new_obj_map());
         override_syscall(|call| match call {
             Syscall::Bpf {
                 cmd: bpf_cmd::BPF_MAP_GET_NEXT_KEY,
@@ -683,12 +543,6 @@ mod tests {
             }
             _ => sys_error(EFAULT),
         });
-        let map = MapData {
-            obj: new_obj_map(),
-            fd: Some(42),
-            pinned: false,
-            btf_fd: None,
-        };
         let hm = HashMap::<_, u32, u32>::new(&map).unwrap();
 
         let mut iter = hm.iter();

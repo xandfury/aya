@@ -1,5 +1,6 @@
 //! Tracepoint programs.
 use std::{fs, io, os::fd::AsFd as _, path::Path};
+
 use thiserror::Error;
 
 use crate::{
@@ -78,15 +79,17 @@ impl TracePoint {
     ///
     /// The returned value can be used to detach, see [TracePoint::detach].
     pub fn attach(&mut self, category: &str, name: &str) -> Result<TracePointLinkId, ProgramError> {
+        let prog_fd = self.fd()?;
+        let prog_fd = prog_fd.as_fd();
         let tracefs = find_tracefs_path()?;
-        let id = read_sys_fs_trace_point_id(tracefs, category, name)?;
+        let id = read_sys_fs_trace_point_id(tracefs, category, name.as_ref())?;
         let fd =
             perf_event_open_trace_point(id, None).map_err(|(_code, io_error)| SyscallError {
                 call: "perf_event_open_trace_point",
                 io_error,
             })?;
 
-        let link = perf_attach(self.data.fd_or_err()?, fd)?;
+        let link = perf_attach(prog_fd, fd)?;
         self.data.links.insert(TracePointLink::new(link))
     }
 
@@ -133,7 +136,7 @@ impl TryFrom<FdLink> for TracePointLink {
     fn try_from(fd_link: FdLink) -> Result<Self, Self::Error> {
         let info = bpf_link_get_info_by_fd(fd_link.fd.as_fd())?;
         if info.type_ == (bpf_link_type::BPF_LINK_TYPE_TRACING as u32) {
-            return Ok(TracePointLink::new(PerfLinkInner::FdLink(fd_link)));
+            return Ok(Self::new(PerfLinkInner::FdLink(fd_link)));
         }
         Err(LinkError::InvalidLink)
     }
@@ -142,7 +145,7 @@ impl TryFrom<FdLink> for TracePointLink {
 pub(crate) fn read_sys_fs_trace_point_id(
     tracefs: &Path,
     category: &str,
-    name: &str,
+    name: &Path,
 ) -> Result<u32, TracePointError> {
     let file = tracefs.join("events").join(category).join(name).join("id");
 

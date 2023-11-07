@@ -5,7 +5,6 @@ use std::os::fd::AsFd as _;
 pub use crate::generated::{
     perf_hw_cache_id, perf_hw_cache_op_id, perf_hw_cache_op_result_id, perf_hw_id, perf_sw_ids,
 };
-
 use crate::{
     generated::{
         bpf_link_type,
@@ -146,6 +145,8 @@ impl PerfEvent {
         scope: PerfEventScope,
         sample_policy: SamplePolicy,
     ) -> Result<PerfEventLinkId, ProgramError> {
+        let prog_fd = self.fd()?;
+        let prog_fd = prog_fd.as_fd();
         let (sample_period, sample_frequency) = match sample_policy {
             SamplePolicy::Period(period) => (period, None),
             SamplePolicy::Frequency(frequency) => (0, Some(frequency)),
@@ -172,7 +173,7 @@ impl PerfEvent {
             io_error,
         })?;
 
-        let link = perf_attach(self.data.fd_or_err()?, fd)?;
+        let link = perf_attach(prog_fd, fd)?;
         self.data.links.insert(PerfEventLink::new(link))
     }
 
@@ -210,7 +211,7 @@ impl TryFrom<FdLink> for PerfEventLink {
     fn try_from(fd_link: FdLink) -> Result<Self, Self::Error> {
         let info = bpf_link_get_info_by_fd(fd_link.fd.as_fd())?;
         if info.type_ == (bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32) {
-            return Ok(PerfEventLink::new(PerfLinkInner::FdLink(fd_link)));
+            return Ok(Self::new(PerfLinkInner::FdLink(fd_link)));
         }
         Err(LinkError::InvalidLink)
     }
