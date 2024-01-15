@@ -550,6 +550,21 @@ pub(crate) fn bpf_prog_get_info_by_fd(
     })
 }
 
+pub(crate) fn bpf_map_get_fd_by_id(map_id: u32) -> Result<OwnedFd, SyscallError> {
+    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
+
+    attr.__bindgen_anon_6.__bindgen_anon_1.map_id = map_id;
+
+    // SAFETY: BPF_MAP_GET_FD_BY_ID returns a new file descriptor.
+    unsafe { fd_sys_bpf(bpf_cmd::BPF_MAP_GET_FD_BY_ID, &mut attr) }.map_err(|(code, io_error)| {
+        assert_eq!(code, -1);
+        SyscallError {
+            call: "bpf_map_get_fd_by_id",
+            io_error,
+        }
+    })
+}
+
 pub(crate) fn bpf_map_get_info_by_fd(fd: BorrowedFd<'_>) -> Result<bpf_map_info, SyscallError> {
     bpf_obj_get_info_by_fd(fd, |_| {})
 }
@@ -1032,6 +1047,10 @@ pub(crate) fn iter_prog_ids() -> impl Iterator<Item = Result<u32, SyscallError>>
 
 pub(crate) fn iter_link_ids() -> impl Iterator<Item = Result<u32, SyscallError>> {
     iter_obj_ids(bpf_cmd::BPF_LINK_GET_NEXT_ID, "bpf_link_get_next_id")
+}
+
+pub(crate) fn iter_map_ids() -> impl Iterator<Item = Result<u32, SyscallError>> {
+    iter_obj_ids(bpf_cmd::BPF_MAP_GET_NEXT_ID, "bpf_map_get_next_id")
 }
 
 pub(crate) fn retry_with_verifier_logs<T>(

@@ -53,7 +53,7 @@ impl KernelVersion {
     }
 
     /// The equivalent of LINUX_VERSION_CODE.
-    pub(crate) fn code(self) -> u32 {
+    pub fn code(self) -> u32 {
         let Self {
             major,
             minor,
@@ -362,6 +362,15 @@ pub(crate) fn bytes_of_slice<T: Pod>(val: &[T]) -> &[u8] {
     // The size is determined in this function.
     // The Pod trait ensures the type is valid to cast to bytes.
     unsafe { slice::from_raw_parts(val.as_ptr().cast(), size) }
+}
+
+pub(crate) fn bytes_of_bpf_name(bpf_name: &[core::ffi::c_char; 16]) -> &[u8] {
+    let length = bpf_name
+        .iter()
+        .rposition(|ch| *ch != 0)
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    unsafe { std::slice::from_raw_parts(bpf_name.as_ptr() as *const _, length) }
 }
 
 #[cfg(test)]

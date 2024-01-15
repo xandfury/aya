@@ -68,15 +68,15 @@ use crate::{
 /// #     }
 /// #     fn clear_ready(&mut self) {}
 /// # }
-/// # let bpf = aya::Bpf::load(&[])?;
+/// # let mut bpf = aya::Bpf::load(&[])?;
 /// use aya::maps::RingBuf;
 /// use std::convert::TryFrom;
 ///
-/// let ring_buf = RingBuf::try_from(bpf.map_mut("ARRAY")?)?;
-/// let poll = poll_fd(ring_buf);
+/// let ring_buf = RingBuf::try_from(bpf.map_mut("ARRAY").unwrap()).unwrap();
+/// let mut poll = poll_fd(ring_buf);
 /// loop {
-///     let mut guard = poll.readable()?;
-///     let ring_buf = guard.inner_mut()
+///     let mut guard = poll.readable();
+///     let ring_buf = guard.inner_mut();
 ///     while let Some(item) = ring_buf.next() {
 ///         println!("Received: {:?}", item);
 ///     }
@@ -411,6 +411,11 @@ struct MMap {
     ptr: NonNull<c_void>,
     len: usize,
 }
+
+// Needed because NonNull<T> is !Send and !Sync out of caution that the data
+// might be aliased unsafely.
+unsafe impl Send for MMap {}
+unsafe impl Sync for MMap {}
 
 impl MMap {
     fn new(
