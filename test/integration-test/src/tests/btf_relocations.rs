@@ -1,14 +1,24 @@
-use aya::{maps::Array, programs::UProbe, util::KernelVersion, BpfLoader, Btf, Endianness};
+use aya::{maps::Array, programs::UProbe, util::KernelVersion, Btf, EbpfLoader, Endianness};
 use test_case::test_case;
 
+// False positive, see: https://github.com/rust-lang/rust-clippy/issues/12537.
+#[allow(clippy::duplicated_attributes)]
 #[test_case("enum_signed_32", false, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), -0x7AAAAAAAi32 as u64)]
 #[test_case("enum_signed_32", true, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), -0x7BBBBBBBi32 as u64)]
+#[test_case("enum_signed_32_checked_variants", false, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), -0x7AAAAAAAi32 as u64)]
+#[test_case("enum_signed_32_checked_variants", true, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), -0x7BBBBBBBi32 as u64)]
 #[test_case("enum_signed_64", false, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), -0xAAAAAAABBBBBBBBi64 as u64)]
 #[test_case("enum_signed_64", true, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), -0xCCCCCCCDDDDDDDDi64 as u64)]
+#[test_case("enum_signed_64_checked_variants", false, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), -0xAAAAAAABBBBBBBi64 as u64)]
+#[test_case("enum_signed_64_checked_variants", true, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), -0xCCCCCCCDDDDDDDi64 as u64)]
 #[test_case("enum_unsigned_32", false, None, 0xAAAAAAAA)]
 #[test_case("enum_unsigned_32", true, None, 0xBBBBBBBB)]
+#[test_case("enum_unsigned_32_checked_variants", false, None, 0xAAAAAAAA)]
+#[test_case("enum_unsigned_32_checked_variants", true, None, 0xBBBBBBBB)]
 #[test_case("enum_unsigned_64", false, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), 0xAAAAAAAABBBBBBBB)]
 #[test_case("enum_unsigned_64", true, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), 0xCCCCCCCCDDDDDDDD)]
+#[test_case("enum_unsigned_64_checked_variants", false, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), 0xAAAAAAAABBBBBBBB)]
+#[test_case("enum_unsigned_64_checked_variants", true, Some((KernelVersion::new(6, 0, 0), "https://github.com/torvalds/linux/commit/6089fb3")), 0xCCCCCCCCDDDDDDDD)]
 #[test_case("field", false, None, 2)]
 #[test_case("field", true, None, 1)]
 #[test_case("pointer", false, None, 42)]
@@ -28,7 +38,7 @@ fn relocation_tests(
             return;
         }
     }
-    let mut bpf = BpfLoader::new()
+    let mut bpf = EbpfLoader::new()
         .btf(
             with_relocations
                 .then(|| Btf::parse(crate::RELOC_BTF, Endianness::default()).unwrap())

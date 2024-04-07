@@ -12,7 +12,7 @@ use libc::{ENOENT, ENOSPC};
 use obj::{
     btf::{BtfEnum64, Enum64},
     maps::{bpf_map_def, LegacyMap},
-    BpfSectionKind, VerifierLog,
+    EbpfSectionKind, VerifierLog,
 };
 
 use crate::{
@@ -112,7 +112,7 @@ pub(crate) fn bpf_get_object(path: &CStr) -> SysResult<OwnedFd> {
     unsafe { fd_sys_bpf(bpf_cmd::BPF_OBJ_GET, &mut attr) }
 }
 
-pub(crate) struct BpfLoadProgramAttrs<'a> {
+pub(crate) struct EbpfLoadProgramAttrs<'a> {
     pub(crate) name: Option<CString>,
     pub(crate) ty: bpf_prog_type,
     pub(crate) insns: &'a [bpf_insn],
@@ -131,7 +131,7 @@ pub(crate) struct BpfLoadProgramAttrs<'a> {
 }
 
 pub(crate) fn bpf_load_program(
-    aya_attr: &BpfLoadProgramAttrs<'_>,
+    aya_attr: &EbpfLoadProgramAttrs<'_>,
     log_buf: &mut [u8],
     verifier_log_level: VerifierLogLevel,
 ) -> SysResult<OwnedFd> {
@@ -435,7 +435,7 @@ pub(crate) fn bpf_prog_attach(
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     attr.__bindgen_anon_5.attach_bpf_fd = prog_fd.as_raw_fd() as u32;
-    attr.__bindgen_anon_5.target_fd = target_fd.as_raw_fd() as u32;
+    attr.__bindgen_anon_5.__bindgen_anon_1.target_fd = target_fd.as_raw_fd() as u32;
     attr.__bindgen_anon_5.attach_type = attach_type as u32;
 
     let ret = sys_bpf(bpf_cmd::BPF_PROG_ATTACH, &mut attr).map_err(|(code, io_error)| {
@@ -457,7 +457,7 @@ pub(crate) fn bpf_prog_detach(
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
     attr.__bindgen_anon_5.attach_bpf_fd = prog_fd.as_raw_fd() as u32;
-    attr.__bindgen_anon_5.target_fd = target_fd.as_raw_fd() as u32;
+    attr.__bindgen_anon_5.__bindgen_anon_1.target_fd = target_fd.as_raw_fd() as u32;
     attr.__bindgen_anon_5.attach_type = attach_type as u32;
 
     let ret = sys_bpf(bpf_cmd::BPF_PROG_DETACH, &mut attr).map_err(|(code, io_error)| {
@@ -481,15 +481,15 @@ pub(crate) fn bpf_prog_query(
 ) -> SysResult<c_long> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
 
-    attr.query.target_fd = target_fd as u32;
+    attr.query.__bindgen_anon_1.target_fd = target_fd as u32;
     attr.query.attach_type = attach_type as u32;
     attr.query.query_flags = query_flags;
-    attr.query.prog_cnt = prog_ids.len() as u32;
+    attr.query.__bindgen_anon_2.prog_cnt = prog_ids.len() as u32;
     attr.query.prog_ids = prog_ids.as_mut_ptr() as u64;
 
     let ret = sys_bpf(bpf_cmd::BPF_PROG_QUERY, &mut attr);
 
-    *prog_cnt = unsafe { attr.query.prog_cnt };
+    *prog_cnt = unsafe { attr.query.__bindgen_anon_2.prog_cnt };
 
     if let Some(attach_flags) = attach_flags {
         *attach_flags = unsafe { attr.query.attach_flags };
@@ -766,7 +766,7 @@ pub(crate) fn is_bpf_global_data_supported() -> bool {
                 ..Default::default()
             },
             section_index: 0,
-            section_kind: BpfSectionKind::Maps,
+            section_kind: EbpfSectionKind::Maps,
             symbol_index: None,
             data: Vec::new(),
         }),
@@ -993,7 +993,7 @@ fn bpf_prog_load(attr: &mut bpf_attr) -> SysResult<OwnedFd> {
 }
 
 fn sys_bpf(cmd: bpf_cmd, attr: &mut bpf_attr) -> SysResult<c_long> {
-    syscall(Syscall::Bpf { cmd, attr })
+    syscall(Syscall::Ebpf { cmd, attr })
 }
 
 fn bpf_obj_get_next_id(
@@ -1096,7 +1096,7 @@ mod tests {
     #[test]
     fn test_perf_link_supported() {
         override_syscall(|call| match call {
-            Syscall::Bpf {
+            Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_LINK_CREATE,
                 ..
             } => Err((-1, io::Error::from_raw_os_error(EBADF))),
@@ -1106,7 +1106,7 @@ mod tests {
         assert!(supported);
 
         override_syscall(|call| match call {
-            Syscall::Bpf {
+            Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_LINK_CREATE,
                 ..
             } => Err((-1, io::Error::from_raw_os_error(EINVAL))),

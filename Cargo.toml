@@ -11,13 +11,13 @@ members = [
     "xtask",
 
     # macros
-    "aya-bpf-macros",
+    "aya-ebpf-macros",
     "aya-log-ebpf-macros",
 
     # ebpf crates
-    "bpf/aya-bpf",
-    "bpf/aya-bpf-bindings",
-    "bpf/aya-log-ebpf",
+    "ebpf/aya-ebpf",
+    "ebpf/aya-ebpf-bindings",
+    "ebpf/aya-log-ebpf",
     "test/integration-ebpf",
 ]
 
@@ -35,13 +35,20 @@ default-members = [
     # tests, and that doesn't work unless they've been built with `cargo xtask`.
     "xtask",
 
-    "aya-bpf-macros",
+    "aya-ebpf-macros",
     "aya-log-ebpf-macros",
 
     # ebpf crates are omitted; they must be built with:
     # --target bpfe{b,l}-unknown-none
     # CARGO_CFG_BPF_TARGET_ARCH={x86_64,aarch64,arm,riscv64}
 ]
+
+[workspace.package]
+authors = ["Aya Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aya-rs/aya"
+homepage = "https://aya-rs.dev"
+edition = "2021"
 
 # NOTE(vadorovsky): Neither cargo-udeps nor cargo-machete are able to detect
 # unused crates defined in this section. It would be nice to teach either of
@@ -50,13 +57,6 @@ default-members = [
 anyhow = { version = "1", default-features = false }
 assert_matches = { version = "1.5.0", default-features = false }
 async-io = { version = "2.0", default-features = false }
-aya = { path = "aya", version = "0.11.0", default-features = false }
-aya-bpf = { path = "bpf/aya-bpf", default-features = false }
-aya-log = { path = "aya-log", default-features = false }
-aya-log-common = { path = "aya-log-common", version = "0.1.13", default-features = false }
-aya-log-parser = { path = "aya-log-parser", default-features = false }
-aya-obj = { path = "aya-obj", version = "0.1.0", default-features = false }
-aya-tool = { path = "aya-tool", default-features = false }
 bindgen = { version = "0.69", default-features = false }
 bitflags = { version = "2.2.1", default-features = false }
 bytes = { version = "1", default-features = false }
@@ -66,19 +66,19 @@ const-assert = { version = "1.0.1", default-features = false }
 core-error = { version = "0.0.0", default-features = false }
 dialoguer = { version = "0.11", default-features = false }
 diff = { version = "0.1.13", default-features = false }
-env_logger = { version = "0.10", default-features = false }
+env_logger = { version = "0.11", default-features = false }
 epoll = { version = "4.3.3", default-features = false }
 futures = { version = "0.3.28", default-features = false }
-hashbrown = { version = "0.14", default-features = false }
+hashbrown = { version = "0.14.3", default-features = false }
 indoc = { version = "2.0", default-features = false }
 integration-ebpf = { path = "test/integration-ebpf", default-features = false }
 lazy_static = { version = "1", default-features = false }
 libc = { version = "0.2.105", default-features = false }
 log = { version = "0.4", default-features = false }
 netns-rs = { version = "0.1", default-features = false }
-nix = { version = "0.27.0", default-features = false }
+nix = { version = "0.28.0", default-features = false }
 num_enum = { version = "0.7", default-features = false }
-object = { version = "0.32", default-features = false }
+object = { version = "0.34", default-features = false }
 proc-macro-error = { version = "1.0", default-features = false }
 proc-macro2 = { version = "1", default-features = false }
 public-api = { version = "0.33.1", default-features = false }
@@ -95,7 +95,7 @@ test-log = { version = "0.2.13", default-features = false }
 testing_logger = { version = "0.1.1", default-features = false }
 thiserror = { version = "1", default-features = false }
 tokio = { version = "1.24.0", default-features = false }
-which = { version = "5.0.0", default-features = false }
+which = { version = "6.0.0", default-features = false }
 xdpilone = { version = "1.0", default-features = false }
 xtask = { path = "xtask", default-features = false }
 

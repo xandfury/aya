@@ -5,7 +5,7 @@ use core::mem;
 
 #[cfg(not(feature = "std"))]
 use crate::std;
-use crate::BpfSectionKind;
+use crate::EbpfSectionKind;
 
 /// Invalid map type encontered
 pub struct InvalidMapTypeError {
@@ -44,8 +44,8 @@ impl TryFrom<u32> for crate::generated::bpf_map_type {
             }
             x if x == BPF_MAP_TYPE_CGRP_STORAGE as u32 => BPF_MAP_TYPE_CGRP_STORAGE,
             x if x == BPF_MAP_TYPE_REUSEPORT_SOCKARRAY as u32 => BPF_MAP_TYPE_REUSEPORT_SOCKARRAY,
-            x if x == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE as u32 => {
-                BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE
+            x if x == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE_DEPRECATED as u32 => {
+                BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE_DEPRECATED
             }
             x if x == BPF_MAP_TYPE_QUEUE as u32 => BPF_MAP_TYPE_QUEUE,
             x if x == BPF_MAP_TYPE_STACK as u32 => BPF_MAP_TYPE_STACK,
@@ -240,10 +240,10 @@ impl Map {
     }
 
     /// Returns the section kind.
-    pub fn section_kind(&self) -> BpfSectionKind {
+    pub fn section_kind(&self) -> EbpfSectionKind {
         match self {
             Map::Legacy(m) => m.section_kind,
-            Map::Btf(_) => BpfSectionKind::BtfMaps,
+            Map::Btf(_) => EbpfSectionKind::BtfMaps,
         }
     }
 
@@ -270,7 +270,7 @@ pub struct LegacyMap {
     /// The section index
     pub section_index: usize,
     /// The section kind
-    pub section_kind: BpfSectionKind,
+    pub section_kind: EbpfSectionKind,
     /// The symbol index.
     ///
     /// This is None for data maps (.bss .data and .rodata).  We don't need

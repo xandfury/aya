@@ -307,7 +307,7 @@ pub(crate) fn tc_handler_make(major: u32, minor: u32) -> u32 {
     (major & TC_H_MAJ_MASK) | (minor & TC_H_MIN_MASK)
 }
 
-/// Include bytes from a file for use in a subsequent [`crate::Bpf::load`].
+/// Include bytes from a file for use in a subsequent [`crate::Ebpf::load`].
 ///
 /// This macro differs from the standard `include_bytes!` macro since it also ensures that
 /// the bytes are correctly aligned to be parsed as an ELF binary. This avoid some nasty
@@ -315,13 +315,13 @@ pub(crate) fn tc_handler_make(major: u32, minor: u32) -> u32 {
 ///
 /// # Examples
 /// ```ignore
-/// use aya::{Bpf, include_bytes_aligned};
+/// use aya::{Ebpf, include_bytes_aligned};
 ///
-/// let mut bpf = Bpf::load(include_bytes_aligned!(
+/// let mut bpf = Ebpf::load(include_bytes_aligned!(
 ///     "/path/to/bpf.o"
 /// ))?;
 ///
-/// # Ok::<(), aya::BpfError>(())
+/// # Ok::<(), aya::EbpfError>(())
 /// ```
 #[macro_export]
 macro_rules! include_bytes_aligned {
@@ -370,7 +370,7 @@ pub(crate) fn bytes_of_bpf_name(bpf_name: &[core::ffi::c_char; 16]) -> &[u8] {
         .rposition(|ch| *ch != 0)
         .map(|pos| pos + 1)
         .unwrap_or(0);
-    unsafe { std::slice::from_raw_parts(bpf_name.as_ptr() as *const _, length) }
+    unsafe { slice::from_raw_parts(bpf_name.as_ptr() as *const _, length) }
 }
 
 #[cfg(test)]

@@ -35,9 +35,9 @@ use crate::{
 /// #     #[error(transparent)]
 /// #     Program(#[from] aya::programs::ProgramError),
 /// #     #[error(transparent)]
-/// #     Bpf(#[from] aya::BpfError)
+/// #     Ebpf(#[from] aya::EbpfError)
 /// # }
-/// # let mut bpf = aya::Bpf::load(&[])?;
+/// # let mut bpf = aya::Ebpf::load(&[])?;
 /// use aya::maps::SockMap;
 /// use aya::programs::SkSkb;
 ///
@@ -77,7 +77,7 @@ impl<T: Borrow<MapData>> SockMap<T> {
         let fd: &MapFd = self.inner.borrow().fd();
         // TODO(https://github.com/rust-lang/rfcs/issues/3066): avoid this unsafe.
         // SAFETY: `SockMapFd` is #[repr(transparent)] over `MapFd`.
-        unsafe { std::mem::transmute(&fd) }
+        unsafe { std::mem::transmute(fd) }
     }
 }
 

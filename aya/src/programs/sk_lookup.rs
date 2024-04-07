@@ -1,3 +1,4 @@
+//! Programmable socket lookup.
 use std::os::fd::AsFd;
 
 use super::links::FdLink;
@@ -31,9 +32,9 @@ use crate::{
 /// #     #[error(transparent)]
 /// #     Program(#[from] aya::programs::ProgramError),
 /// #     #[error(transparent)]
-/// #     Bpf(#[from] aya::BpfError)
+/// #     Ebpf(#[from] aya::EbpfError)
 /// # }
-/// # let mut bpf = aya::Bpf::load(&[])?;
+/// # let mut bpf = aya::Ebpf::load(&[])?;
 /// use std::fs::File;
 /// use aya::programs::SkLookup;
 ///

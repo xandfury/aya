@@ -282,32 +282,21 @@ impl Drop for PerfBuffer {
     }
 }
 
-#[derive(Debug)]
-#[repr(C)]
-struct Sample {
-    header: perf_event_header,
-    size: u32,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-struct LostSamples {
-    header: perf_event_header,
-    id: u64,
-    count: u64,
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{fmt::Debug, mem};
+    use std::fmt::Debug;
 
     use assert_matches::assert_matches;
 
     use super::*;
-    use crate::{
-        generated::perf_event_mmap_page,
-        sys::{override_syscall, Syscall, TEST_MMAP_RET},
-    };
+    use crate::sys::{override_syscall, Syscall, TEST_MMAP_RET};
+
+    #[repr(C)]
+    #[derive(Debug)]
+    struct Sample {
+        header: perf_event_header,
+        size: u32,
+    }
 
     const PAGE_SIZE: usize = 4096;
     union MMappedBuf {
@@ -374,6 +363,14 @@ mod tests {
             data: [0; PAGE_SIZE * 2],
         };
         fake_mmap(&mmapped_buf);
+
+        #[repr(C)]
+        #[derive(Debug)]
+        struct LostSamples {
+            header: perf_event_header,
+            id: u64,
+            count: u64,
+        }
 
         let evt = LostSamples {
             header: perf_event_header {

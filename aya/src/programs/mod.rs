@@ -5,36 +5,42 @@
 //!
 //! # Loading and attaching programs
 //!
-//! When you call [`Bpf::load_file`] or [`Bpf::load`], all the programs included
+//! When you call [`Ebpf::load_file`] or [`Ebpf::load`], all the programs included
 //! in the object code are parsed and relocated. Programs are not loaded
 //! automatically though, since often you will need to do some application
 //! specific setup before you can actually load them.
 //!
-//! In order to load and attach a program, you need to retrieve it using [`Bpf::program_mut`],
+//! In order to load and attach a program, you need to retrieve it using [`Ebpf::program_mut`],
 //! then call the `load()` and `attach()` methods, for example:
 //!
 //! ```no_run
-//! use aya::{Bpf, programs::KProbe};
+//! use aya::{Ebpf, programs::KProbe};
 //!
-//! let mut bpf = Bpf::load_file("ebpf_programs.o")?;
+//! let mut bpf = Ebpf::load_file("ebpf_programs.o")?;
 //! // intercept_wakeups is the name of the program we want to load
 //! let program: &mut KProbe = bpf.program_mut("intercept_wakeups").unwrap().try_into()?;
 //! program.load()?;
 //! // intercept_wakeups will be called every time try_to_wake_up() is called
 //! // inside the kernel
 //! program.attach("try_to_wake_up", 0)?;
-//! # Ok::<(), aya::BpfError>(())
+//! # Ok::<(), aya::EbpfError>(())
 //! ```
 //!
 //! The signature of the `attach()` method varies depending on what kind of
 //! program you're trying to attach.
 //!
-//! [`Bpf::load_file`]: crate::Bpf::load_file
-//! [`Bpf::load`]: crate::Bpf::load
-//! [`Bpf::programs`]: crate::Bpf::programs
-//! [`Bpf::program`]: crate::Bpf::program
-//! [`Bpf::program_mut`]: crate::Bpf::program_mut
+//! [`Ebpf::load_file`]: crate::Ebpf::load_file
+//! [`Ebpf::load`]: crate::Ebpf::load
+//! [`Ebpf::programs`]: crate::Ebpf::programs
+//! [`Ebpf::program`]: crate::Ebpf::program
+//! [`Ebpf::program_mut`]: crate::Ebpf::program_mut
 //! [`maps`]: crate::maps
+
+// modules we don't export
+mod probe;
+mod utils;
+
+// modules we explicitly export so their pub items (Links etc) get exported too
 pub mod cgroup_device;
 pub mod cgroup_skb;
 pub mod cgroup_sock;
@@ -50,18 +56,16 @@ pub mod lirc_mode2;
 pub mod lsm;
 pub mod perf_attach;
 pub mod perf_event;
-mod probe;
-mod raw_trace_point;
-mod sk_lookup;
-mod sk_msg;
-mod sk_skb;
-mod sock_ops;
-mod socket_filter;
+pub mod raw_trace_point;
+pub mod sk_lookup;
+pub mod sk_msg;
+pub mod sk_skb;
+pub mod sock_ops;
+pub mod socket_filter;
 pub mod tc;
 pub mod tp_btf;
 pub mod trace_point;
 pub mod uprobe;
-mod utils;
 pub mod xdp;
 
 use std::{
@@ -74,48 +78,53 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-pub use cgroup_device::CgroupDevice;
-pub use cgroup_skb::{CgroupSkb, CgroupSkbAttachType};
-pub use cgroup_sock::{CgroupSock, CgroupSockAttachType};
-pub use cgroup_sock_addr::{CgroupSockAddr, CgroupSockAddrAttachType};
-pub use cgroup_sockopt::{CgroupSockopt, CgroupSockoptAttachType};
-pub use cgroup_sysctl::CgroupSysctl;
-pub use extension::{Extension, ExtensionError};
-pub use fentry::FEntry;
-pub use fexit::FExit;
-pub use kprobe::{KProbe, KProbeError};
 use libc::ENOSPC;
-pub use links::Link;
-use links::*;
-pub use lirc_mode2::LircMode2;
-pub use lsm::Lsm;
-use perf_attach::*;
-pub use perf_event::{PerfEvent, PerfEventScope, PerfTypeId, SamplePolicy};
-pub use probe::ProbeKind;
-pub use raw_trace_point::RawTracePoint;
-pub use sk_lookup::SkLookup;
-pub use sk_msg::SkMsg;
-pub use sk_skb::{SkSkb, SkSkbKind};
-pub use sock_ops::SockOps;
-pub use socket_filter::{SocketFilter, SocketFilterError};
-pub use tc::{SchedClassifier, TcAttachType, TcError};
 use thiserror::Error;
-pub use tp_btf::BtfTracePoint;
-pub use trace_point::{TracePoint, TracePointError};
-pub use uprobe::{UProbe, UProbeError};
-pub use xdp::{Xdp, XdpError, XdpFlags};
 
+// re-export the main items needed to load and attach
+pub use crate::programs::{
+    cgroup_device::CgroupDevice,
+    cgroup_skb::{CgroupSkb, CgroupSkbAttachType},
+    cgroup_sock::{CgroupSock, CgroupSockAttachType},
+    cgroup_sock_addr::{CgroupSockAddr, CgroupSockAddrAttachType},
+    cgroup_sockopt::{CgroupSockopt, CgroupSockoptAttachType},
+    cgroup_sysctl::CgroupSysctl,
+    extension::{Extension, ExtensionError},
+    fentry::FEntry,
+    fexit::FExit,
+    kprobe::{KProbe, KProbeError},
+    links::Link,
+    lirc_mode2::LircMode2,
+    lsm::Lsm,
+    perf_event::{PerfEvent, PerfEventScope, PerfTypeId, SamplePolicy},
+    probe::ProbeKind,
+    raw_trace_point::RawTracePoint,
+    sk_lookup::SkLookup,
+    sk_msg::SkMsg,
+    sk_skb::{SkSkb, SkSkbKind},
+    sock_ops::SockOps,
+    socket_filter::{SocketFilter, SocketFilterError},
+    tc::{SchedClassifier, TcAttachType, TcError},
+    tp_btf::BtfTracePoint,
+    trace_point::{TracePoint, TracePointError},
+    uprobe::{UProbe, UProbeError},
+    xdp::{Xdp, XdpError, XdpFlags},
+};
 use crate::{
     generated::{bpf_attach_type, bpf_link_info, bpf_prog_info, bpf_prog_type},
     maps::MapError,
     obj::{self, btf::BtfError, VerifierLog},
     pin::PinError,
-    programs::utils::{boot_time, get_fdinfo},
+    programs::{
+        links::*,
+        perf_attach::*,
+        utils::{boot_time, get_fdinfo},
+    },
     sys::{
         bpf_btf_get_fd_by_id, bpf_get_object, bpf_link_get_fd_by_id, bpf_link_get_info_by_fd,
         bpf_load_program, bpf_pin_object, bpf_prog_get_fd_by_id, bpf_prog_get_info_by_fd,
         bpf_prog_query, iter_link_ids, iter_prog_ids, retry_with_verifier_logs,
-        BpfLoadProgramAttrs, SyscallError,
+        EbpfLoadProgramAttrs, SyscallError,
     },
     util::{bytes_of_bpf_name, KernelVersion},
     VerifierLogLevel,
@@ -602,7 +611,7 @@ fn load_program<T: Link>(
     }
     let obj = obj.as_ref().unwrap();
     let (
-        crate::obj::Program {
+        obj::Program {
             license,
             kernel_version,
             ..
@@ -632,7 +641,7 @@ fn load_program<T: Link>(
         None
     };
 
-    let attr = BpfLoadProgramAttrs {
+    let attr = EbpfLoadProgramAttrs {
         name: prog_name,
         ty: prog_type,
         insns: instructions,
@@ -1108,8 +1117,8 @@ impl ProgramInfo {
 
 /// Returns an iterator over all loaded bpf programs.
 ///
-/// This differs from [`crate::Bpf::programs`] since it will return all programs
-/// listed on the host system and not only programs a specific [`crate::Bpf`] instance.
+/// This differs from [`crate::Ebpf::programs`] since it will return all programs
+/// listed on the host system and not only programs a specific [`crate::Ebpf`] instance.
 ///
 /// # Example
 /// ```

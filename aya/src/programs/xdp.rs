@@ -1,7 +1,6 @@
 //! eXpress Data Path (XDP) programs.
 
 use std::{
-    convert::TryFrom,
     ffi::CString,
     hash::Hash,
     io,
@@ -9,7 +8,6 @@ use std::{
     path::Path,
 };
 
-use bitflags;
 use libc::if_nametoindex;
 use thiserror::Error;
 
@@ -73,12 +71,12 @@ bitflags::bitflags! {
 /// # Examples
 ///
 /// ```no_run
-/// # let mut bpf = Bpf::load_file("ebpf_programs.o")?;
-/// use aya::{Bpf, programs::{Xdp, XdpFlags}};
+/// # let mut bpf = Ebpf::load_file("ebpf_programs.o")?;
+/// use aya::{Ebpf, programs::{Xdp, XdpFlags}};
 ///
 /// let program: &mut Xdp = bpf.program_mut("intercept_packets").unwrap().try_into()?;
 /// program.attach("eth0", XdpFlags::default())?;
-/// # Ok::<(), aya::BpfError>(())
+/// # Ok::<(), aya::EbpfError>(())
 /// ```
 #[derive(Debug)]
 #[doc(alias = "BPF_PROG_TYPE_XDP")]
