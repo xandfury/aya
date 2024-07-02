@@ -37,7 +37,7 @@ jobs:
         run: git ls-files -- '*.c' '*.h' | xargs clang-format --dry-run --Werror
 
       - name: Check Markdown
-        uses: DavidAnson/markdownlint-cli2-action@v15
+        uses: DavidAnson/markdownlint-cli2-action@v16
 
       - name: Check TOML formatting
         run: taplo fmt --check
@@ -187,24 +187,11 @@ jobs:
         with:
           submodules: recursive
 
-      - if: runner.os == 'Linux'
-        uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
           components: rust-src
           targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl
-
-      #### Temporary workaround for LLVM 18 not being released yet.
-      - if: runner.os == 'macOS'
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2024-02-12
-          components: rust-src
-          targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl
-
-      - if: runner.os == 'macOS'
-        run: sed -i '' 's/nightly/nightly-2024-02-12/' test/integration-ebpf/rust-toolchain.toml
-      #### End of temporary workaround.
 
       - uses: Swatinem/rust-cache@v2
 
@@ -256,9 +243,9 @@ jobs:
 
       - name: bpf-linker
         if: runner.os == 'macOS'
-        # NB: rustc doesn't ship libLLVM.so on macOS, so disable proxying (default feature).
-        # Remove --rev when LLVM18 is released.
-        run: cargo install bpf-linker --git https://github.com/aya-rs/bpf-linker.git --rev 821f92990074cb7e950e25129dcd55e20424cede --no-default-features
+        # NB: rustc doesn't ship libLLVM.so on macOS, so disable proxying (default feature). We also
+        # --force so that bpf-linker gets always relinked against the latest LLVM installed by brew.
+        run: cargo install --force bpf-linker --git https://github.com/aya-rs/bpf-linker.git --no-default-features
 
       - name: Download debian kernels
         if: runner.arch == 'ARM64'
@@ -269,7 +256,7 @@ jobs:
           # TODO: enable tests on kernels before 6.0.
           # linux-image-5.10.0-23-cloud-arm64-unsigned_5.10.179-3_arm64.deb \
           printf '%s\0' \
-            linux-image-6.1.0-15-cloud-arm64-unsigned_6.1.66-1_arm64.deb \
+            linux-image-6.1.0-16-cloud-arm64-unsigned_6.1.67-1_arm64.deb \
           | xargs -0 -t -P0 -I {} wget -nd -nv -P test/.tmp/debian-kernels/arm64 ftp://ftp.us.debian.org/debian/pool/main/l/linux/{}
 
       - name: Download debian kernels
@@ -281,7 +268,7 @@ jobs:
           # linux-image-4.19.0-21-cloud-amd64-unsigned_4.19.249-2_amd64.deb \
           # linux-image-5.10.0-23-cloud-amd64-unsigned_5.10.179-3_amd64.deb \
           printf '%s\0' \
-            linux-image-6.1.0-15-cloud-amd64-unsigned_6.1.66-1_amd64.deb \
+            linux-image-6.1.0-16-cloud-amd64-unsigned_6.1.67-1_amd64.deb \
           | xargs -0 -t -P0 -I {} wget -nd -nv -P test/.tmp/debian-kernels/amd64 ftp://ftp.us.debian.org/debian/pool/main/l/linux/{}
 
       - name: Extract debian kernels

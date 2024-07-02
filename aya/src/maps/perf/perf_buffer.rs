@@ -1,7 +1,7 @@
 use std::{
     ffi::c_void,
     io, mem,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
+    os::fd::{AsFd, BorrowedFd},
     ptr, slice,
     sync::atomic::{self, AtomicPtr, Ordering},
 };
@@ -88,7 +88,7 @@ pub(crate) struct PerfBuffer {
     buf: AtomicPtr<perf_event_mmap_page>,
     size: usize,
     page_size: usize,
-    fd: OwnedFd,
+    fd: crate::MockableFd,
 }
 
 impl PerfBuffer {
@@ -120,11 +120,12 @@ impl PerfBuffer {
             });
         }
 
+        let fd = crate::MockableFd::from_fd(fd);
         let perf_buf = Self {
             buf: AtomicPtr::new(buf as *mut perf_event_mmap_page),
-            fd,
             size,
             page_size,
+            fd,
         };
 
         perf_event_ioctl(perf_buf.fd.as_fd(), PERF_EVENT_IOC_ENABLE, 0)
@@ -219,9 +220,12 @@ impl PerfBuffer {
 
         let head = unsafe { (*header).data_head } as usize;
         let mut tail = unsafe { (*header).data_tail } as usize;
-        while head != tail {
+        let result = loop {
+            if head == tail {
+                break Ok(());
+            }
             if buf_n == buffers.len() {
-                break;
+                break Ok(());
             }
 
             let buf = &mut buffers[buf_n];
@@ -243,24 +247,16 @@ impl PerfBuffer {
                 Err(e) => {
                     // we got an error and we didn't process any events, propagate the error
                     // and give the caller a chance to increase buffers
-                    atomic::fence(Ordering::SeqCst);
-                    unsafe { (*header).data_tail = tail as u64 };
-                    return Err(e);
+                    break Err(e);
                 }
             }
             tail += event_size;
-        }
+        };
 
         atomic::fence(Ordering::SeqCst);
         unsafe { (*header).data_tail = tail as u64 };
 
-        Ok(events)
-    }
-}
-
-impl AsRawFd for PerfBuffer {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        result.map(|()| events)
     }
 }
 
@@ -306,7 +302,9 @@ mod tests {
 
     fn fake_mmap(buf: &MMappedBuf) {
         override_syscall(|call| match call {
-            Syscall::PerfEventOpen { .. } | Syscall::PerfEventIoctl { .. } => Ok(42),
+            Syscall::PerfEventOpen { .. } | Syscall::PerfEventIoctl { .. } => {
+                Ok(crate::MockableFd::mock_signed_fd().into())
+            }
             call => panic!("unexpected syscall: {:?}", call),
         });
         TEST_MMAP_RET.with(|ret| *ret.borrow_mut() = buf as *const _ as *mut _);
@@ -329,7 +327,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     fn test_no_out_bufs() {
         let mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
@@ -341,7 +338,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`unsafe { (*header).data_tail = tail as u64 };` is attempting a write access using using a tag that only grants SharedReadOnly permission"
+    )]
     fn test_no_events() {
         let mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
@@ -357,7 +357,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`ptr::write_unaligned(dst, value)` is attempting a write access but no exposed tags have suitable permission in the borrow stack for this location"
+    )]
     fn test_read_first_lost() {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
@@ -430,7 +433,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`ptr::write_unaligned(dst, value)` is attempting a write access but no exposed tags have suitable permission in the borrow stack for this location"
+    )]
     fn test_read_first_sample() {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
@@ -448,7 +454,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`ptr::write_unaligned(dst, value)` is attempting a write access but no exposed tags have suitable permission in the borrow stack for this location"
+    )]
     fn test_read_many_with_many_reads() {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
@@ -471,7 +480,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`ptr::write_unaligned(dst, value)` is attempting a write access but no exposed tags have suitable permission in the borrow stack for this location"
+    )]
     fn test_read_many_with_one_read() {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
@@ -493,7 +505,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`ptr::write_unaligned(dst, value)` is attempting a write access but no exposed tags have suitable permission in the borrow stack for this location"
+    )]
     fn test_read_last_sample() {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
@@ -513,7 +528,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`ptr::write_unaligned(dst, value)` is attempting a write access but no exposed tags have suitable permission in the borrow stack for this location"
+    )]
     fn test_read_wrapping_sample_size() {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],
@@ -542,7 +560,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`ptr::write_unaligned(dst, value)` is attempting a write access but no exposed tags have suitable permission in the borrow stack for this location"
+    )]
     fn test_read_wrapping_value() {
         let mut mmapped_buf = MMappedBuf {
             data: [0; PAGE_SIZE * 2],

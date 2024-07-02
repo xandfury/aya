@@ -49,7 +49,7 @@
 //! implement the [Pod] trait.
 use std::{
     borrow::Borrow,
-    ffi::{c_long, CString},
+    ffi::CString,
     fmt, io,
     marker::PhantomData,
     mem,
@@ -127,7 +127,7 @@ pub enum MapError {
         /// Map name
         name: String,
         /// Error code
-        code: c_long,
+        code: i64,
         #[source]
         /// Original io::Error
         io_error: io::Error,
@@ -210,11 +210,26 @@ impl From<InvalidMapTypeError> for MapError {
 
 /// A map file descriptor.
 #[derive(Debug)]
-pub struct MapFd(OwnedFd);
+pub struct MapFd {
+    fd: crate::MockableFd,
+}
+
+impl MapFd {
+    fn from_fd(fd: OwnedFd) -> Self {
+        let fd = crate::MockableFd::from_fd(fd);
+        Self { fd }
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        let Self { fd } = self;
+        let fd = fd.try_clone()?;
+        Ok(Self { fd })
+    }
+}
 
 impl AsFd for MapFd {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        let Self(fd) = self;
+        let Self { fd } = self;
         fd.as_fd()
     }
 }
@@ -558,8 +573,10 @@ impl MapData {
                     io_error,
                 }
             })?;
-        let fd = MapFd(fd);
-        Ok(Self { obj, fd })
+        Ok(Self {
+            obj,
+            fd: MapFd::from_fd(fd),
+        })
     }
 
     pub(crate) fn create_pinned_by_name<P: AsRef<Path>>(
@@ -585,10 +602,10 @@ impl MapData {
             call: "BPF_OBJ_GET",
             io_error,
         }) {
-            Ok(fd) => {
-                let fd = MapFd(fd);
-                Ok(Self { obj, fd })
-            }
+            Ok(fd) => Ok(Self {
+                obj,
+                fd: MapFd::from_fd(fd),
+            }),
             Err(_) => {
                 let map = Self::create(obj, name, btf_fd)?;
                 map.pin(&path).map_err(|error| MapError::PinError {
@@ -658,7 +675,7 @@ impl MapData {
         let MapInfo(info) = MapInfo::new_from_fd(fd.as_fd())?;
         Ok(Self {
             obj: parse_map_info(info, PinningType::None),
-            fd: MapFd(fd),
+            fd: MapFd::from_fd(fd),
         })
     }
 
@@ -972,7 +989,7 @@ impl MapInfo {
     pub fn fd(&self) -> Result<MapFd, MapError> {
         let Self(info) = self;
         let fd = bpf_map_get_fd_by_id(info.id)?;
-        Ok(MapFd(fd))
+        Ok(MapFd::from_fd(fd))
     }
 
     /// Loads a map from a pinned path in bpffs.
@@ -1021,35 +1038,59 @@ pub fn loaded_maps() -> impl Iterator<Item = Result<MapInfo, MapError>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::os::fd::AsRawFd as _;
-
-    use assert_matches::assert_matches;
-    use libc::{c_char, EFAULT};
-
-    use super::*;
+mod test_utils {
     use crate::{
         bpf_map_def,
-        generated::{bpf_cmd, bpf_map_type::BPF_MAP_TYPE_HASH},
-        obj::maps::LegacyMap,
+        generated::{bpf_cmd, bpf_map_type},
+        maps::MapData,
+        obj::{self, maps::LegacyMap, EbpfSectionKind},
         sys::{override_syscall, Syscall},
     };
 
-    fn new_obj_map() -> obj::Map {
+    pub(super) fn new_map(obj: obj::Map) -> MapData {
+        override_syscall(|call| match call {
+            Syscall::Ebpf {
+                cmd: bpf_cmd::BPF_MAP_CREATE,
+                ..
+            } => Ok(crate::MockableFd::mock_signed_fd().into()),
+            call => panic!("unexpected syscall {:?}", call),
+        });
+        MapData::create(obj, "foo", None).unwrap()
+    }
+
+    pub(super) fn new_obj_map<K>(map_type: bpf_map_type) -> obj::Map {
         obj::Map::Legacy(LegacyMap {
             def: bpf_map_def {
-                map_type: BPF_MAP_TYPE_HASH as u32,
-                key_size: 4,
+                map_type: map_type as u32,
+                key_size: std::mem::size_of::<K>() as u32,
                 value_size: 4,
                 max_entries: 1024,
                 ..Default::default()
             },
             section_index: 0,
             section_kind: EbpfSectionKind::Maps,
-            symbol_index: Some(0),
             data: Vec::new(),
+            symbol_index: None,
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsRawFd as _;
+
+    use assert_matches::assert_matches;
+    use libc::{c_char, EFAULT};
+
+    fn new_obj_map() -> obj::Map {
+        test_utils::new_obj_map::<u32>(crate::generated::bpf_map_type::BPF_MAP_TYPE_HASH)
+    }
+
+    use super::*;
+    use crate::{
+        generated::bpf_cmd,
+        sys::{override_syscall, Syscall},
+    };
 
     #[test]
     fn test_from_map_id() {
@@ -1062,13 +1103,16 @@ mod tests {
                     unsafe { attr.__bindgen_anon_6.__bindgen_anon_1.map_id },
                     1234
                 );
-                Ok(42)
+                Ok(crate::MockableFd::mock_signed_fd().into())
             }
             Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_OBJ_GET_INFO_BY_FD,
                 attr,
             } => {
-                assert_eq!(unsafe { attr.info.bpf_fd }, 42);
+                assert_eq!(
+                    unsafe { attr.info.bpf_fd },
+                    crate::MockableFd::mock_unsigned_fd(),
+                );
                 Ok(0)
             }
             _ => Err((-1, io::Error::from_raw_os_error(EFAULT))),
@@ -1079,7 +1123,7 @@ mod tests {
             Ok(MapData {
                 obj: _,
                 fd,
-            }) => assert_eq!(fd.as_fd().as_raw_fd(), 42)
+            }) => assert_eq!(fd.as_fd().as_raw_fd(), crate::MockableFd::mock_signed_fd())
         );
     }
 
@@ -1089,7 +1133,7 @@ mod tests {
             Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_MAP_CREATE,
                 ..
-            } => Ok(42),
+            } => Ok(crate::MockableFd::mock_signed_fd().into()),
             _ => Err((-1, io::Error::from_raw_os_error(EFAULT))),
         });
 
@@ -1098,15 +1142,15 @@ mod tests {
             Ok(MapData {
                 obj: _,
                 fd,
-            }) => assert_eq!(fd.as_fd().as_raw_fd(), 42)
+            }) => assert_eq!(fd.as_fd().as_raw_fd(), crate::MockableFd::mock_signed_fd())
         );
     }
 
     #[test]
-    // Syscall overrides are performing integer-to-pointer conversions, which
-    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
-    // to support stable as well.
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`let map_info = unsafe { &mut *(attr.info.info as *mut bpf_map_info) }` is trying to retag from <wildcard> for Unique permission, but no exposed tags have suitable permission in the borrow stack for this location"
+    )]
     fn test_name() {
         use crate::generated::bpf_map_info;
 
@@ -1116,7 +1160,7 @@ mod tests {
             Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_MAP_CREATE,
                 ..
-            } => Ok(42),
+            } => Ok(crate::MockableFd::mock_signed_fd().into()),
             Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_OBJ_GET_INFO_BY_FD,
                 attr,
@@ -1139,10 +1183,10 @@ mod tests {
     }
 
     #[test]
-    // Syscall overrides are performing integer-to-pointer conversions, which
-    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
-    // to support stable as well.
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(
+        miri,
+        ignore = "`let map_info = unsafe { &mut *(attr.info.info as *mut bpf_map_info) }` is trying to retag from <wildcard> for Unique permission, but no exposed tags have suitable permission in the borrow stack for this location"
+    )]
     fn test_loaded_maps() {
         use crate::generated::bpf_map_info;
 
@@ -1162,13 +1206,15 @@ mod tests {
             Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_MAP_GET_FD_BY_ID,
                 attr,
-            } => Ok((1000 + unsafe { attr.__bindgen_anon_6.__bindgen_anon_1.map_id }) as c_long),
+            } => Ok((unsafe { attr.__bindgen_anon_6.__bindgen_anon_1.map_id }
+                + crate::MockableFd::mock_unsigned_fd())
+            .into()),
             Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_OBJ_GET_INFO_BY_FD,
                 attr,
             } => {
                 let map_info = unsafe { &mut *(attr.info.info as *mut bpf_map_info) };
-                map_info.id = unsafe { attr.info.bpf_fd } - 1000;
+                map_info.id = unsafe { attr.info.bpf_fd } - crate::MockableFd::mock_unsigned_fd();
                 map_info.key_size = 32;
                 map_info.value_size = 64;
                 map_info.map_flags = 1234;
@@ -1178,19 +1224,31 @@ mod tests {
             _ => Err((-1, io::Error::from_raw_os_error(EFAULT))),
         });
 
-        let loaded_maps: Vec<_> = loaded_maps().collect();
-        assert_eq!(loaded_maps.len(), 5);
-
-        for (i, map_info) in loaded_maps.into_iter().enumerate() {
-            let i = i + 1;
-            let map_info = map_info.unwrap();
-            assert_eq!(map_info.id(), i as u32);
-            assert_eq!(map_info.key_size(), 32);
-            assert_eq!(map_info.value_size(), 64);
-            assert_eq!(map_info.map_flags(), 1234);
-            assert_eq!(map_info.max_entries(), 99);
-            assert_eq!(map_info.fd().unwrap().as_fd().as_raw_fd(), 1000 + i as i32);
-        }
+        assert_eq!(
+            loaded_maps()
+                .map(|map_info| {
+                    let map_info = map_info.unwrap();
+                    (
+                        map_info.id(),
+                        map_info.key_size(),
+                        map_info.value_size(),
+                        map_info.map_flags(),
+                        map_info.max_entries(),
+                        map_info.fd().unwrap().as_fd().as_raw_fd(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            (1..6)
+                .map(|i: u8| (
+                    i.into(),
+                    32,
+                    64,
+                    1234,
+                    99,
+                    crate::MockableFd::mock_signed_fd() + i32::from(i)
+                ))
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]

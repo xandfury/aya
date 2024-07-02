@@ -103,30 +103,30 @@ impl<T: Borrow<MapData>, K: Pod, V: Pod> IterableMap<K, V> for HashMap<T, K, V> 
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::c_long, io};
+    use std::io;
 
     use assert_matches::assert_matches;
     use libc::{EFAULT, ENOENT};
 
-    use super::{
-        super::test_utils::{self, new_map},
-        *,
-    };
+    use super::*;
     use crate::{
         generated::{
             bpf_attr, bpf_cmd,
             bpf_map_type::{BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH},
         },
-        maps::Map,
+        maps::{
+            test_utils::{self, new_map},
+            Map,
+        },
         obj,
         sys::{override_syscall, SysResult, Syscall},
     };
 
     fn new_obj_map() -> obj::Map {
-        test_utils::new_obj_map(BPF_MAP_TYPE_HASH)
+        test_utils::new_obj_map::<u32>(BPF_MAP_TYPE_HASH)
     }
 
-    fn sys_error(value: i32) -> SysResult<c_long> {
+    fn sys_error(value: i32) -> SysResult<i64> {
         Err((-1, io::Error::from_raw_os_error(value)))
     }
 
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_try_from_ok_lru() {
-        let map_data = || new_map(test_utils::new_obj_map(BPF_MAP_TYPE_LRU_HASH));
+        let map_data = || new_map(test_utils::new_obj_map::<u32>(BPF_MAP_TYPE_LRU_HASH));
         let map = Map::HashMap(map_data());
         assert!(HashMap::<_, u32, u32>::try_from(&map).is_ok());
         let map = Map::LruHashMap(map_data());
@@ -332,7 +332,7 @@ mod tests {
         assert_matches!(keys, Ok(ks) if ks.is_empty())
     }
 
-    fn get_next_key(attr: &bpf_attr) -> SysResult<c_long> {
+    fn get_next_key(attr: &bpf_attr) -> SysResult<i64> {
         match bpf_key(attr) {
             None => set_next_key(attr, 10),
             Some(10) => set_next_key(attr, 20),
@@ -344,7 +344,7 @@ mod tests {
         Ok(1)
     }
 
-    fn lookup_elem(attr: &bpf_attr) -> SysResult<c_long> {
+    fn lookup_elem(attr: &bpf_attr) -> SysResult<i64> {
         match bpf_key(attr) {
             Some(10) => set_ret(attr, 100),
             Some(20) => set_ret(attr, 200),
@@ -357,10 +357,6 @@ mod tests {
     }
 
     #[test]
-    // Syscall overrides are performing integer-to-pointer conversions, which
-    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
-    // to support stable as well.
-    #[cfg_attr(miri, ignore)]
     fn test_keys() {
         let map = new_map(new_obj_map());
 
@@ -379,10 +375,6 @@ mod tests {
     }
 
     #[test]
-    // Syscall overrides are performing integer-to-pointer conversions, which
-    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
-    // to support stable as well.
-    #[cfg_attr(miri, ignore)]
     fn test_keys_error() {
         let map = new_map(new_obj_map());
         override_syscall(|call| match call {
@@ -416,10 +408,6 @@ mod tests {
     }
 
     #[test]
-    // Syscall overrides are performing integer-to-pointer conversions, which
-    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
-    // to support stable as well.
-    #[cfg_attr(miri, ignore)]
     fn test_iter() {
         let map = new_map(new_obj_map());
         override_syscall(|call| match call {
@@ -439,10 +427,6 @@ mod tests {
     }
 
     #[test]
-    // Syscall overrides are performing integer-to-pointer conversions, which
-    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
-    // to support stable as well.
-    #[cfg_attr(miri, ignore)]
     fn test_iter_key_deleted() {
         let map = new_map(new_obj_map());
         override_syscall(|call| match call {
@@ -473,10 +457,6 @@ mod tests {
     }
 
     #[test]
-    // Syscall overrides are performing integer-to-pointer conversions, which
-    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
-    // to support stable as well.
-    #[cfg_attr(miri, ignore)]
     fn test_iter_key_error() {
         let map = new_map(new_obj_map());
         override_syscall(|call| match call {
@@ -516,10 +496,6 @@ mod tests {
     }
 
     #[test]
-    // Syscall overrides are performing integer-to-pointer conversions, which
-    // should be done with `ptr::from_exposed_addr` in Rust nightly, but we have
-    // to support stable as well.
-    #[cfg_attr(miri, ignore)]
     fn test_iter_value_error() {
         let map = new_map(new_obj_map());
         override_syscall(|call| match call {

@@ -54,7 +54,6 @@
     missing_docs,
     non_ascii_idents,
     noop_method_call,
-    pointer_structural_match,
     rust_2021_incompatible_closure_captures,
     rust_2021_incompatible_or_patterns,
     rust_2021_prefixes_incompatible_syntax,
@@ -69,7 +68,7 @@
     unused_import_braces,
     unused_lifetimes,
     unused_macro_rules,
-    unused_qualifications,
+    //unused_qualifications, https://github.com/rust-lang/rust/commit/9ccc7b7 added size_of to the prelude, but we need to continue to qualify it so that we build on older compilers.
     //unused_results,
 )]
 #![allow(clippy::missing_safety_doc, clippy::len_without_is_empty)]
@@ -88,8 +87,88 @@ pub use programs::loaded_programs;
 mod sys;
 pub mod util;
 
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
 pub use bpf::*;
 pub use obj::btf::{Btf, BtfError};
 pub use object::Endianness;
 #[doc(hidden)]
 pub use sys::netlink_set_link_up;
+
+// See https://github.com/rust-lang/rust/pull/124210; this structure exists to avoid crashing the
+// process when we try to close a fake file descriptor.
+#[derive(Debug)]
+struct MockableFd {
+    #[cfg(not(test))]
+    fd: OwnedFd,
+    #[cfg(test)]
+    fd: Option<OwnedFd>,
+}
+
+impl MockableFd {
+    #[cfg(test)]
+    const fn mock_signed_fd() -> i32 {
+        1337
+    }
+
+    #[cfg(test)]
+    const fn mock_unsigned_fd() -> u32 {
+        1337
+    }
+
+    #[cfg(not(test))]
+    fn from_fd(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+
+    #[cfg(test)]
+    fn from_fd(fd: OwnedFd) -> Self {
+        Self { fd: Some(fd) }
+    }
+
+    #[cfg(not(test))]
+    fn try_clone(&self) -> std::io::Result<Self> {
+        let Self { fd } = self;
+        let fd = fd.try_clone()?;
+        Ok(Self { fd })
+    }
+
+    #[cfg(test)]
+    fn try_clone(&self) -> std::io::Result<Self> {
+        let Self { fd } = self;
+        let fd = fd.as_ref().map(OwnedFd::try_clone).transpose()?;
+        Ok(Self { fd })
+    }
+}
+
+impl AsFd for MockableFd {
+    #[cfg(not(test))]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        let Self { fd } = self;
+        fd.as_fd()
+    }
+
+    #[cfg(test)]
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        let Self { fd } = self;
+        fd.as_ref().unwrap().as_fd()
+    }
+}
+
+impl Drop for MockableFd {
+    #[cfg(not(test))]
+    fn drop(&mut self) {
+        // Intentional no-op.
+    }
+
+    #[cfg(test)]
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+
+        let Self { fd } = self;
+        if fd.as_ref().unwrap().as_raw_fd() >= Self::mock_signed_fd() {
+            let fd: OwnedFd = fd.take().unwrap();
+            std::mem::forget(fd)
+        }
+    }
+}
