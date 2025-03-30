@@ -14,8 +14,8 @@ use bytes::BytesMut;
 use tokio::io::unix::AsyncFd;
 
 use crate::maps::{
-    perf::{Events, PerfBufferError, PerfEventArray, PerfEventArrayBuffer},
     MapData, MapError, PinError,
+    perf::{Events, PerfBufferError, PerfEventArray, PerfEventArrayBuffer},
 };
 
 /// A `Future` based map that can be used to receive events from eBPF programs using the linux
@@ -57,14 +57,13 @@ use crate::maps::{
 /// // try to convert the PERF_ARRAY map to an AsyncPerfEventArray
 /// let mut perf_array = AsyncPerfEventArray::try_from(bpf.take_map("PERF_ARRAY").unwrap())?;
 ///
-/// for cpu_id in online_cpus()? {
+/// for cpu_id in online_cpus().map_err(|(_, error)| error)? {
 ///     // open a separate perf buffer for each cpu
 ///     let mut buf = perf_array.open(cpu_id, None)?;
 ///
 ///     // process each perf buffer in a separate task
 ///     task::spawn(async move {
-///         let mut buffers = (0..10)
-///             .map(|_| BytesMut::with_capacity(1024))
+///         let mut buffers = std::iter::repeat_n(BytesMut::with_capacity(1024), 10)
 ///             .collect::<Vec<_>>();
 ///
 ///         loop {

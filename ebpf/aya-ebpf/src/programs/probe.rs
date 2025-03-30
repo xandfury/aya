@@ -1,12 +1,19 @@
 use core::ffi::c_void;
 
-#[cfg(not(any(bpf_target_arch = "aarch64", bpf_target_arch = "riscv64")))]
+#[cfg(any(
+    bpf_target_arch = "x86_64",
+    bpf_target_arch = "arm",
+    bpf_target_arch = "powerpc64",
+    bpf_target_arch = "mips"
+))]
 use crate::bindings::pt_regs;
-#[cfg(bpf_target_arch = "aarch64")]
+// aarch64 uses user_pt_regs instead of pt_regs
+#[cfg(any(bpf_target_arch = "aarch64", bpf_target_arch = "s390x"))]
 use crate::bindings::user_pt_regs as pt_regs;
+// riscv64 uses user_regs_struct instead of pt_regs
 #[cfg(bpf_target_arch = "riscv64")]
 use crate::bindings::user_regs_struct as pt_regs;
-use crate::{args::FromPtRegs, EbpfContext};
+use crate::{EbpfContext, args::FromPtRegs};
 
 pub struct ProbeContext {
     pub regs: *mut pt_regs,
@@ -24,8 +31,8 @@ impl ProbeContext {
     /// # Examples
     ///
     /// ```no_run
-    /// # #![allow(non_camel_case_types)]
-    /// # #![allow(dead_code)]
+    /// # #![expect(non_camel_case_types)]
+    /// # #![expect(dead_code)]
     /// # use aya_ebpf::{programs::ProbeContext, cty::c_int, helpers::bpf_probe_read};
     /// # type pid_t = c_int;
     /// # struct task_struct {

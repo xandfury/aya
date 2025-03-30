@@ -1,23 +1,26 @@
 //! Program relocation handling.
 
-use alloc::{borrow::ToOwned, collections::BTreeMap, string::String};
+use alloc::{borrow::ToOwned as _, collections::BTreeMap, string::String};
 use core::mem;
 
 use log::debug;
 use object::{SectionIndex, SymbolKind};
 
-#[cfg(not(feature = "std"))]
-use crate::std;
 use crate::{
+    EbpfSectionKind,
     generated::{
-        bpf_insn, BPF_CALL, BPF_JMP, BPF_K, BPF_PSEUDO_CALL, BPF_PSEUDO_FUNC, BPF_PSEUDO_MAP_FD,
-        BPF_PSEUDO_MAP_VALUE,
+        BPF_CALL, BPF_JMP, BPF_K, BPF_PSEUDO_CALL, BPF_PSEUDO_FUNC, BPF_PSEUDO_MAP_FD,
+        BPF_PSEUDO_MAP_VALUE, bpf_insn,
     },
     maps::Map,
     obj::{Function, Object},
     util::{HashMap, HashSet},
-    EbpfSectionKind,
 };
+
+#[cfg(feature = "std")]
+type RawFd = std::os::fd::RawFd;
+#[cfg(not(feature = "std"))]
+type RawFd = core::ffi::c_int;
 
 pub(crate) const INS_SIZE: usize = mem::size_of::<bpf_insn>();
 
@@ -64,7 +67,9 @@ pub enum RelocationError {
     },
 
     /// Unknown function
-    #[error("program at section {section_index} and address {address:#x} was not found while relocating")]
+    #[error(
+        "program at section {section_index} and address {address:#x} was not found while relocating"
+    )]
     UnknownProgram {
         /// The function section index
         section_index: usize,
@@ -104,7 +109,7 @@ pub(crate) struct Symbol {
 
 impl Object {
     /// Relocates the map references
-    pub fn relocate_maps<'a, I: Iterator<Item = (&'a str, std::os::fd::RawFd, &'a Map)>>(
+    pub fn relocate_maps<'a, I: Iterator<Item = (&'a str, RawFd, &'a Map)>>(
         &mut self,
         maps: I,
         text_sections: &HashSet<usize>,
@@ -179,8 +184,8 @@ impl Object {
 fn relocate_maps<'a, I: Iterator<Item = &'a Relocation>>(
     fun: &mut Function,
     relocations: I,
-    maps_by_section: &HashMap<usize, (&str, std::os::fd::RawFd, &Map)>,
-    maps_by_symbol: &HashMap<usize, (&str, std::os::fd::RawFd, &Map)>,
+    maps_by_section: &HashMap<usize, (&str, RawFd, &Map)>,
+    maps_by_symbol: &HashMap<usize, (&str, RawFd, &Map)>,
     symbol_table: &HashMap<usize, Symbol>,
     text_sections: &HashSet<usize>,
 ) -> Result<(), RelocationError> {
@@ -497,7 +502,7 @@ fn insn_is_call(ins: &bpf_insn) -> bool {
 
 #[cfg(test)]
 mod test {
-    use alloc::{string::ToString, vec, vec::Vec};
+    use alloc::{string::ToString as _, vec, vec::Vec};
 
     use super::*;
     use crate::maps::{BtfMap, LegacyMap};

@@ -1,12 +1,12 @@
 use alloc::{string::String, vec, vec::Vec};
 
-use bytes::BufMut;
+use bytes::BufMut as _;
 use object::Endianness;
 
 use crate::{
     generated::{bpf_func_info, bpf_line_info},
     relocation::INS_SIZE,
-    util::{bytes_of, HashMap},
+    util::{HashMap, bytes_of},
 };
 
 /* The func_info subsection layout:
@@ -83,6 +83,7 @@ impl FuncSecInfo {
     }
 
     /// Returns the number of [bpf_func_info] entries.
+    #[expect(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.func_info.len()
     }
@@ -188,6 +189,7 @@ impl LineSecInfo {
     }
 
     /// Returns the number of entries.
+    #[expect(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.line_info.len()
     }

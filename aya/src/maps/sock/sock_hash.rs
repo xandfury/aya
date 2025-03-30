@@ -5,12 +5,12 @@ use std::{
 };
 
 use crate::{
-    maps::{
-        check_kv_size, hash_map, sock::SockMapFd, IterableMap, MapData, MapError, MapFd, MapIter,
-        MapKeys,
-    },
-    sys::{bpf_map_lookup_elem, SyscallError},
     Pod,
+    maps::{
+        IterableMap, MapData, MapError, MapFd, MapIter, MapKeys, check_kv_size, hash_map,
+        sock::SockMapFd,
+    },
+    sys::{SyscallError, bpf_map_lookup_elem},
 };
 
 /// A hash map of TCP or UDP sockets.
@@ -83,7 +83,7 @@ impl<T: Borrow<MapData>, K: Pod> SockHash<T, K> {
     /// Returns the fd of the socket stored at the given key.
     pub fn get(&self, key: &K, flags: u64) -> Result<RawFd, MapError> {
         let fd = self.inner.borrow().fd().as_fd();
-        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(_, io_error)| SyscallError {
+        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|io_error| SyscallError {
             call: "bpf_map_lookup_elem",
             io_error,
         })?;

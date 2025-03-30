@@ -3,12 +3,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use aya::{programs::UProbe, Ebpf};
+use aya::{Ebpf, programs::UProbe};
 use aya_log::EbpfLogger;
 use log::{Level, Log, Record};
 use test_log::test;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn trigger_ebpf_program() {
     core::hint::black_box(trigger_ebpf_program);
@@ -63,7 +63,7 @@ async fn log() {
 
     let prog: &mut UProbe = bpf.program_mut("test_log").unwrap().try_into().unwrap();
     prog.load().unwrap();
-    prog.attach(Some("trigger_ebpf_program"), 0, "/proc/self/exe", None)
+    prog.attach("trigger_ebpf_program", "/proc/self/exe", None, None)
         .unwrap();
 
     // Call the function that the uprobe is attached to, so it starts logging.
@@ -106,7 +106,52 @@ async fn log() {
     assert_eq!(
         records.next(),
         Some(&CapturedLog {
-            body: "ipv4: 10.0.0.1, ipv6: 2001:db8::1".into(),
+            body: "ip structs, without format hint: ipv4: 10.0.0.1, ipv6: 2001:db8::1".into(),
+            level: Level::Info,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: "ip structs, with format hint: ipv4: 10.0.0.1, ipv6: 2001:db8::1".into(),
+            level: Level::Info,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: "ip enums, without format hint: ipv4: 10.0.0.1, ipv6: 2001:db8::1".into(),
+            level: Level::Info,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: "ip enums, with format hint: ipv4: 10.0.0.1, ipv6: 2001:db8::1".into(),
+            level: Level::Info,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: "ip as bits: ipv4: 10.0.0.1".into(),
+            level: Level::Info,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: "ip as octets: ipv4: 10.0.0.1, ipv6: 2001:db8::1".into(),
             level: Level::Info,
             target: "log".into(),
         })

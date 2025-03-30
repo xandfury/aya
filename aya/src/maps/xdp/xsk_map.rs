@@ -2,12 +2,12 @@
 
 use std::{
     borrow::{Borrow, BorrowMut},
-    os::fd::{AsFd, AsRawFd, RawFd},
+    os::fd::{AsFd as _, AsRawFd, BorrowedFd, RawFd},
 };
 
 use crate::{
-    maps::{check_bounds, check_kv_size, MapData, MapError},
-    sys::{bpf_map_update_elem, SyscallError},
+    maps::{MapData, MapError, check_bounds, check_kv_size},
+    sys::{SyscallError, bpf_map_delete_elem, bpf_map_update_elem},
 };
 
 /// An array of AF_XDP sockets.
@@ -50,12 +50,23 @@ impl<T: Borrow<MapData>> XskMap<T> {
     /// Returns the number of elements in the array.
     ///
     /// This corresponds to the value of `bpf_map_def::max_entries` on the eBPF side.
+    #[expect(clippy::len_without_is_empty)]
     pub fn len(&self) -> u32 {
         self.inner.borrow().obj.max_entries()
     }
 }
 
 impl<T: BorrowMut<MapData>> XskMap<T> {
+    fn with_fd(
+        &mut self,
+        index: u32,
+        f: impl FnOnce(BorrowedFd<'_>) -> Result<(), SyscallError>,
+    ) -> Result<(), MapError> {
+        let data = self.inner.borrow_mut();
+        check_bounds(data, index)?;
+        f(data.fd().as_fd()).map_err(Into::into)
+    }
+
     /// Sets the `AF_XDP` socket at a given index.
     ///
     /// When redirecting a packet, the `AF_XDP` socket at `index` will recieve the packet. Note
@@ -67,15 +78,28 @@ impl<T: BorrowMut<MapData>> XskMap<T> {
     /// Returns [`MapError::OutOfBounds`] if `index` is out of bounds, [`MapError::SyscallError`]
     /// if `bpf_map_update_elem` fails.
     pub fn set(&mut self, index: u32, socket_fd: impl AsRawFd, flags: u64) -> Result<(), MapError> {
-        let data = self.inner.borrow_mut();
-        check_bounds(data, index)?;
-        let fd = data.fd().as_fd();
-        bpf_map_update_elem(fd, Some(&index), &socket_fd.as_raw_fd(), flags).map_err(
-            |(_, io_error)| SyscallError {
-                call: "bpf_map_update_elem",
+        self.with_fd(index, |fd| {
+            bpf_map_update_elem(fd, Some(&index), &socket_fd.as_raw_fd(), flags).map_err(
+                |io_error| SyscallError {
+                    call: "bpf_map_update_elem",
+                    io_error,
+                },
+            )
+        })
+    }
+
+    /// Un-sets the `AF_XDP` socket at a given index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MapError::OutOfBounds`] if `index` is out of bounds, [`MapError::SyscallError`]
+    /// if `bpf_map_delete_elem` fails.
+    pub fn unset(&mut self, index: u32) -> Result<(), MapError> {
+        self.with_fd(index, |fd| {
+            bpf_map_delete_elem(fd, &index).map_err(|io_error| SyscallError {
+                call: "bpf_map_delete_elem",
                 io_error,
-            },
-        )?;
-        Ok(())
+            })
+        })
     }
 }

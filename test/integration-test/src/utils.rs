@@ -8,7 +8,7 @@ use std::{
 
 use aya::netlink_set_link_up;
 use libc::if_nametoindex;
-use netns_rs::{get_from_current_thread, NetNs};
+use netns_rs::{NetNs, get_from_current_thread};
 
 pub struct NetNsGuard {
     name: String,
@@ -70,3 +70,34 @@ impl Drop for NetNsGuard {
         println!("Exited network namespace {}", self.name);
     }
 }
+
+/// If the `KernelVersion::current >= $version`, `assert!($cond)`, else `assert!(!$cond)`.
+macro_rules! kernel_assert {
+    ($cond:expr, $version:expr $(,)?) => {
+        let current = aya::util::KernelVersion::current().unwrap();
+        let required: aya::util::KernelVersion = $version;
+        if current >= required {
+            assert!($cond, "{current} >= {required}");
+        } else {
+            assert!(!$cond, "{current} < {required}");
+        }
+    };
+}
+
+pub(crate) use kernel_assert;
+
+/// If the `KernelVersion::current >= $version`, `assert_eq!($left, $right)`, else
+/// `assert_ne!($left, $right)`.
+macro_rules! kernel_assert_eq {
+    ($left:expr, $right:expr, $version:expr $(,)?) => {
+        let current = aya::util::KernelVersion::current().unwrap();
+        let required: aya::util::KernelVersion = $version;
+        if current >= required {
+            assert_eq!($left, $right, "{current} >= {required}");
+        } else {
+            assert_ne!($left, $right, "{current} < {required}");
+        }
+    };
+}
+
+pub(crate) use kernel_assert_eq;

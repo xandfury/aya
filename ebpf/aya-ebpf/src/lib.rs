@@ -8,32 +8,30 @@
     html_logo_url = "https://aya-rs.dev/assets/images/crabby.svg",
     html_favicon_url = "https://aya-rs.dev/assets/images/crabby.svg"
 )]
-#![cfg_attr(
-    feature = "const_assert",
-    allow(incomplete_features),
-    feature(generic_const_exprs)
-)]
+#![cfg_attr(unstable, expect(incomplete_features), feature(generic_const_exprs))]
 #![cfg_attr(unstable, feature(never_type))]
 #![cfg_attr(target_arch = "bpf", feature(asm_experimental_arch))]
-#![allow(clippy::missing_safety_doc)]
-#![deny(warnings)]
 #![warn(clippy::cast_lossless, clippy::cast_sign_loss)]
 #![no_std]
 
 pub use aya_ebpf_bindings::bindings;
 
 mod args;
-pub use args::PtRegs;
+pub use args::{PtRegs, RawTracepointArgs};
+#[expect(clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
 pub mod helpers;
 pub mod maps;
 pub mod programs;
 
-use core::ffi::c_void;
+use core::{ffi::c_void, ptr::NonNull};
 
 pub use aya_ebpf_cty as cty;
 pub use aya_ebpf_macros as macros;
 use cty::{c_int, c_long};
-use helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid};
+use helpers::{
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_map_delete_elem,
+    bpf_map_lookup_elem, bpf_map_update_elem,
+};
 
 pub const TASK_COMM_LEN: usize = 16;
 
@@ -62,18 +60,47 @@ pub trait EbpfContext {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
+#[expect(clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn memset(s: *mut u8, c: c_int, n: usize) {
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     let b = c as u8;
     for i in 0..n {
         *s.add(i) = b;
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
+#[expect(clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *mut u8, n: usize) {
+    copy_forward(dest, src, n);
+}
+
+#[unsafe(no_mangle)]
+#[expect(clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *mut u8, n: usize) {
+    let delta = (dest as usize).wrapping_sub(src as usize);
+    if delta >= n {
+        // We can copy forwards because either dest is far enough ahead of src,
+        // or src is ahead of dest (and delta overflowed).
+        copy_forward(dest, src, n);
+    } else {
+        copy_backward(dest, src, n);
+    }
+}
+
+#[inline(always)]
+#[expect(unsafe_op_in_unsafe_fn)]
+unsafe fn copy_forward(dest: *mut u8, src: *mut u8, n: usize) {
     for i in 0..n {
+        *dest.add(i) = *src.add(i);
+    }
+}
+
+#[inline(always)]
+#[expect(unsafe_op_in_unsafe_fn)]
+unsafe fn copy_backward(dest: *mut u8, src: *mut u8, n: usize) {
+    for i in (0..n).rev() {
         *dest.add(i) = *src.add(i);
     }
 }
@@ -104,4 +131,34 @@ pub fn check_bounds_signed(value: i64, lower: i64, upper: i64) -> bool {
         let _ = upper;
         unimplemented!()
     }
+}
+
+#[inline]
+fn insert<K, V>(
+    def: *mut bindings::bpf_map_def,
+    key: &K,
+    value: &V,
+    flags: u64,
+) -> Result<(), c_long> {
+    let key: *const _ = key;
+    let value: *const _ = value;
+    match unsafe { bpf_map_update_elem(def.cast(), key.cast(), value.cast(), flags) } {
+        0 => Ok(()),
+        ret => Err(ret),
+    }
+}
+
+#[inline]
+fn remove<K>(def: *mut bindings::bpf_map_def, key: &K) -> Result<(), c_long> {
+    let key: *const _ = key;
+    match unsafe { bpf_map_delete_elem(def.cast(), key.cast()) } {
+        0 => Ok(()),
+        ret => Err(ret),
+    }
+}
+
+#[inline]
+fn lookup<K, V>(def: *mut bindings::bpf_map_def, key: &K) -> Option<NonNull<V>> {
+    let key: *const _ = key;
+    NonNull::new(unsafe { bpf_map_lookup_elem(def.cast(), key.cast()) }.cast())
 }

@@ -1,19 +1,14 @@
-use std::{
-    convert::TryInto as _,
-    fs::remove_file,
-    path::Path,
-    thread,
-    time::{Duration, SystemTime},
-};
+use std::{convert::TryInto as _, fs::remove_file, path::Path, thread, time::Duration};
 
 use aya::{
+    Ebpf,
     maps::Array,
     programs::{
+        FlowDissector, KProbe, TracePoint, UProbe, Xdp, XdpFlags,
         links::{FdLink, PinnedLink},
-        loaded_links, loaded_programs, KProbe, TracePoint, UProbe, Xdp, XdpFlags,
+        loaded_links, loaded_programs,
     },
     util::KernelVersion,
-    Ebpf,
 };
 use aya_obj::programs::XdpAttachType;
 use test_log::test;
@@ -48,7 +43,7 @@ fn multiple_btf_maps() {
 
     let prog: &mut UProbe = bpf.program_mut("bpf_prog").unwrap().try_into().unwrap();
     prog.load().unwrap();
-    prog.attach(Some("trigger_bpf_program"), 0, "/proc/self/exe", None)
+    prog.attach("trigger_bpf_program", "/proc/self/exe", None, None)
         .unwrap();
 
     trigger_bpf_program();
@@ -98,7 +93,7 @@ fn pin_lifecycle_multiple_btf_maps() {
 
     let prog: &mut UProbe = bpf.program_mut("bpf_prog").unwrap().try_into().unwrap();
     prog.load().unwrap();
-    prog.attach(Some("trigger_bpf_program"), 0, "/proc/self/exe", None)
+    prog.attach("trigger_bpf_program", "/proc/self/exe", None, None)
         .unwrap();
 
     trigger_bpf_program();
@@ -127,7 +122,7 @@ fn pin_lifecycle_multiple_btf_maps() {
     remove_file(map_pin_by_name_path).unwrap();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn trigger_bpf_program() {
     core::hint::black_box(trigger_bpf_program);
@@ -222,42 +217,6 @@ fn unload_xdp() {
 }
 
 #[test]
-fn test_loaded_at() {
-    let mut bpf = Ebpf::load(crate::TEST).unwrap();
-    let prog: &mut Xdp = bpf.program_mut("pass").unwrap().try_into().unwrap();
-
-    // SystemTime is not monotonic, which can cause this test to flake. We don't expect the clock
-    // timestamp to continuously jump around, so we add some retries. If the test is ever correct,
-    // we know that the value returned by loaded_at() was reasonable relative to SystemTime::now().
-    let mut failures = Vec::new();
-    for _ in 0..5 {
-        let t1 = SystemTime::now();
-        prog.load().unwrap();
-        let t2 = SystemTime::now();
-        let loaded_at = prog.info().unwrap().loaded_at();
-        prog.unload().unwrap();
-        let range = t1..t2;
-        if range.contains(&loaded_at) {
-            failures.clear();
-            break;
-        }
-        failures.push(LoadedAtRange(loaded_at, range));
-    }
-    assert!(
-        failures.is_empty(),
-        "loaded_at was not in range: {failures:?}",
-    );
-
-    struct LoadedAtRange(SystemTime, std::ops::Range<SystemTime>);
-    impl std::fmt::Debug for LoadedAtRange {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let Self(loaded_at, range) = self;
-            write!(f, "{range:?}.contains({loaded_at:?})")
-        }
-    }
-}
-
-#[test]
 fn unload_kprobe() {
     let mut bpf = Ebpf::load(crate::TEST).unwrap();
     let prog: &mut KProbe = bpf.program_mut("test_kprobe").unwrap().try_into().unwrap();
@@ -280,6 +239,15 @@ fn unload_kprobe() {
     prog.unload().unwrap();
 
     assert_unloaded("test_kprobe");
+}
+
+#[test]
+fn memmove() {
+    let mut bpf = Ebpf::load(crate::MEMMOVE_TEST).unwrap();
+    let prog: &mut Xdp = bpf.program_mut("do_dnat").unwrap().try_into().unwrap();
+
+    prog.load().unwrap();
+    assert_loaded("do_dnat");
 }
 
 #[test]
@@ -321,7 +289,7 @@ fn basic_uprobe() {
     prog.load().unwrap();
     assert_loaded("test_uprobe");
     let link = prog
-        .attach(Some("uprobe_function"), 0, "/proc/self/exe", None)
+        .attach("uprobe_function", "/proc/self/exe", None, None)
         .unwrap();
 
     {
@@ -334,13 +302,41 @@ fn basic_uprobe() {
     prog.load().unwrap();
 
     assert_loaded("test_uprobe");
-    prog.attach(Some("uprobe_function"), 0, "/proc/self/exe", None)
+    prog.attach("uprobe_function", "/proc/self/exe", None, None)
         .unwrap();
 
     assert_loaded("test_uprobe");
     prog.unload().unwrap();
 
     assert_unloaded("test_uprobe");
+}
+
+#[test]
+fn basic_flow_dissector() {
+    let mut bpf = Ebpf::load(crate::TEST).unwrap();
+    let prog: &mut FlowDissector = bpf.program_mut("test_flow").unwrap().try_into().unwrap();
+
+    prog.load().unwrap();
+    assert_loaded("test_flow");
+
+    let net_ns = std::fs::File::open("/proc/self/ns/net").unwrap();
+    let link = prog.attach(net_ns.try_clone().unwrap()).unwrap();
+    {
+        let _link_owned = prog.take_link(link).unwrap();
+        prog.unload().unwrap();
+        assert_loaded_and_linked("test_flow");
+    };
+
+    assert_unloaded("test_flow");
+    prog.load().unwrap();
+
+    assert_loaded("test_flow");
+    prog.attach(net_ns).unwrap();
+
+    assert_loaded("test_flow");
+    prog.unload().unwrap();
+
+    assert_unloaded("test_flow");
 }
 
 #[test]
@@ -378,7 +374,9 @@ fn pin_link() {
 fn pin_lifecycle() {
     let kernel_version = KernelVersion::current().unwrap();
     if kernel_version < KernelVersion::new(5, 18, 0) {
-        eprintln!("skipping test on kernel {kernel_version:?}, support for BPF_F_XDP_HAS_FRAGS was added in 5.18.0; see https://github.com/torvalds/linux/commit/c2f2cdb");
+        eprintln!(
+            "skipping test on kernel {kernel_version:?}, support for BPF_F_XDP_HAS_FRAGS was added in 5.18.0; see https://github.com/torvalds/linux/commit/c2f2cdb"
+        );
         return;
     }
 
@@ -547,7 +545,7 @@ fn pin_lifecycle_kprobe() {
     assert_unloaded("test_kprobe");
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 extern "C" fn uprobe_function() {
     core::hint::black_box(uprobe_function);
@@ -581,7 +579,7 @@ fn pin_lifecycle_uprobe() {
     {
         let mut prog = UProbe::from_pin(FIRST_PIN_PATH, aya::programs::ProbeKind::UProbe).unwrap();
         let link_id = prog
-            .attach(Some("uprobe_function"), 0, "/proc/self/exe", None)
+            .attach("uprobe_function", "/proc/self/exe", None, None)
             .unwrap();
         let link = prog.take_link(link_id).unwrap();
         let fd_link: FdLink = link.try_into().unwrap();

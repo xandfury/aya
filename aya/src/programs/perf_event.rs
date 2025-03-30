@@ -2,25 +2,26 @@
 
 use std::os::fd::AsFd as _;
 
-pub use crate::generated::{
+use aya_obj::generated::{
+    bpf_link_type,
+    bpf_prog_type::BPF_PROG_TYPE_PERF_EVENT,
+    perf_type_id::{
+        PERF_TYPE_BREAKPOINT, PERF_TYPE_HARDWARE, PERF_TYPE_HW_CACHE, PERF_TYPE_RAW,
+        PERF_TYPE_SOFTWARE, PERF_TYPE_TRACEPOINT,
+    },
+};
+pub use aya_obj::generated::{
     perf_hw_cache_id, perf_hw_cache_op_id, perf_hw_cache_op_result_id, perf_hw_id, perf_sw_ids,
 };
+
 use crate::{
-    generated::{
-        bpf_link_type,
-        bpf_prog_type::BPF_PROG_TYPE_PERF_EVENT,
-        perf_type_id::{
-            PERF_TYPE_BREAKPOINT, PERF_TYPE_HARDWARE, PERF_TYPE_HW_CACHE, PERF_TYPE_RAW,
-            PERF_TYPE_SOFTWARE, PERF_TYPE_TRACEPOINT,
-        },
-    },
     programs::{
+        FdLink, LinkError, ProgramData, ProgramError, ProgramType,
         links::define_link_wrapper,
         load_program, perf_attach,
         perf_attach::{PerfLinkIdInner, PerfLinkInner},
-        FdLink, LinkError, ProgramData, ProgramError,
     },
-    sys::{bpf_link_get_info_by_fd, perf_event_open, SyscallError},
+    sys::{SyscallError, bpf_link_get_info_by_fd, perf_event_open},
 };
 
 /// The type of perf event
@@ -52,7 +53,6 @@ pub enum SamplePolicy {
 
 /// The scope of a PerfEvent
 #[derive(Debug, Clone)]
-#[allow(clippy::enum_variant_names)]
 pub enum PerfEventScope {
     /// Calling process, any cpu
     CallingProcessAnyCpu,
@@ -109,7 +109,7 @@ pub enum PerfEventScope {
 /// let prog: &mut PerfEvent = bpf.program_mut("observe_cpu_clock").unwrap().try_into()?;
 /// prog.load()?;
 ///
-/// for cpu in online_cpus()? {
+/// for cpu in online_cpus().map_err(|(_, error)| error)? {
 ///     prog.attach(
 ///         PerfTypeId::Software,
 ///         PERF_COUNT_SW_CPU_CLOCK as u64,
@@ -127,6 +127,9 @@ pub struct PerfEvent {
 }
 
 impl PerfEvent {
+    /// The type of the program according to the kernel.
+    pub const PROGRAM_TYPE: ProgramType = ProgramType::PerfEvent;
+
     /// Loads the program inside the kernel.
     pub fn load(&mut self) -> Result<(), ProgramError> {
         load_program(BPF_PROG_TYPE_PERF_EVENT, &mut self.data)
@@ -175,28 +178,13 @@ impl PerfEvent {
             inherit,
             0,
         )
-        .map_err(|(_code, io_error)| SyscallError {
+        .map_err(|io_error| SyscallError {
             call: "perf_event_open",
             io_error,
         })?;
 
-        let link = perf_attach(prog_fd, fd)?;
+        let link = perf_attach(prog_fd, fd, None /* cookie */)?;
         self.data.links.insert(PerfEventLink::new(link))
-    }
-
-    /// Detaches the program.
-    ///
-    /// See [PerfEvent::attach].
-    pub fn detach(&mut self, link_id: PerfEventLinkId) -> Result<(), ProgramError> {
-        self.data.links.remove(link_id)
-    }
-
-    /// Takes ownership of the link referenced by the provided link_id.
-    ///
-    /// The link will be detached on `Drop` and the caller is now responsible
-    /// for managing its lifetime.
-    pub fn take_link(&mut self, link_id: PerfEventLinkId) -> Result<PerfEventLink, ProgramError> {
-        self.data.take_link(link_id)
     }
 }
 
@@ -230,5 +218,6 @@ define_link_wrapper!(
     /// The type returned by [PerfEvent::attach]. Can be passed to [PerfEvent::detach].
     PerfEventLinkId,
     PerfLinkInner,
-    PerfLinkIdInner
+    PerfLinkIdInner,
+    PerfEvent,
 );

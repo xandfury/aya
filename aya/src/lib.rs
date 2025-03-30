@@ -54,10 +54,6 @@
     missing_docs,
     non_ascii_idents,
     noop_method_call,
-    rust_2021_incompatible_closure_captures,
-    rust_2021_incompatible_or_patterns,
-    rust_2021_prefixes_incompatible_syntax,
-    rust_2021_prelude_collisions,
     single_use_lifetimes,
     trivial_numeric_casts,
     unreachable_pub,
@@ -71,26 +67,22 @@
     //unused_qualifications, https://github.com/rust-lang/rust/commit/9ccc7b7 added size_of to the prelude, but we need to continue to qualify it so that we build on older compilers.
     //unused_results,
 )]
-#![allow(clippy::missing_safety_doc, clippy::len_without_is_empty)]
 #![cfg_attr(
     all(feature = "async_tokio", feature = "async_std"),
-    allow(unused_crate_dependencies)
+    expect(unused_crate_dependencies)
 )]
 
 mod bpf;
-use aya_obj::generated;
 pub mod maps;
-use aya_obj as obj;
 pub mod pin;
 pub mod programs;
-pub use programs::loaded_programs;
-mod sys;
+pub mod sys;
 pub mod util;
 
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
+pub use aya_obj::btf::{Btf, BtfError};
 pub use bpf::*;
-pub use obj::btf::{Btf, BtfError};
 pub use object::Endianness;
 #[doc(hidden)]
 pub use sys::netlink_set_link_up;
@@ -123,51 +115,78 @@ impl MockableFd {
 
     #[cfg(test)]
     fn from_fd(fd: OwnedFd) -> Self {
-        Self { fd: Some(fd) }
+        let fd = Some(fd);
+        Self { fd }
     }
 
     #[cfg(not(test))]
-    fn try_clone(&self) -> std::io::Result<Self> {
+    fn inner(&self) -> &OwnedFd {
         let Self { fd } = self;
-        let fd = fd.try_clone()?;
-        Ok(Self { fd })
+        fd
     }
 
     #[cfg(test)]
-    fn try_clone(&self) -> std::io::Result<Self> {
+    fn inner(&self) -> &OwnedFd {
         let Self { fd } = self;
-        let fd = fd.as_ref().map(OwnedFd::try_clone).transpose()?;
-        Ok(Self { fd })
+        fd.as_ref().unwrap()
+    }
+
+    #[cfg(not(test))]
+    fn into_inner(self) -> OwnedFd {
+        self.fd
+    }
+
+    #[cfg(test)]
+    fn into_inner(mut self) -> OwnedFd {
+        self.fd.take().unwrap()
+    }
+
+    fn try_clone(&self) -> std::io::Result<Self> {
+        let fd = self.inner();
+        let fd = fd.try_clone()?;
+        Ok(Self::from_fd(fd))
+    }
+}
+
+impl<T> From<T> for MockableFd
+where
+    OwnedFd: From<T>,
+{
+    fn from(value: T) -> Self {
+        let fd = OwnedFd::from(value);
+        Self::from_fd(fd)
     }
 }
 
 impl AsFd for MockableFd {
-    #[cfg(not(test))]
     fn as_fd(&self) -> BorrowedFd<'_> {
-        let Self { fd } = self;
-        fd.as_fd()
-    }
-
-    #[cfg(test)]
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        let Self { fd } = self;
-        fd.as_ref().unwrap().as_fd()
+        self.inner().as_fd()
     }
 }
 
-impl Drop for MockableFd {
-    #[cfg(not(test))]
-    fn drop(&mut self) {
-        // Intentional no-op.
+impl AsRawFd for MockableFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner().as_raw_fd()
     }
+}
 
-    #[cfg(test)]
+impl FromRawFd for MockableFd {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Self::from_fd(fd)
+    }
+}
+
+#[cfg(test)]
+impl Drop for MockableFd {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd as _;
 
         let Self { fd } = self;
-        if fd.as_ref().unwrap().as_raw_fd() >= Self::mock_signed_fd() {
-            let fd: OwnedFd = fd.take().unwrap();
+        let fd = fd.take().unwrap();
+        if fd.as_raw_fd() < Self::mock_signed_fd() {
+            std::mem::drop(fd)
+        } else {
             std::mem::forget(fd)
         }
     }

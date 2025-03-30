@@ -2,8 +2,8 @@ use std::{
     mem,
     os::fd::AsRawFd as _,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
 };
@@ -11,43 +11,18 @@ use std::{
 use anyhow::Context as _;
 use assert_matches::assert_matches;
 use aya::{
-    maps::{array::PerCpuArray, ring_buf::RingBuf, MapData},
+    Ebpf, EbpfLoader,
+    maps::{MapData, array::PerCpuArray, ring_buf::RingBuf},
     programs::UProbe,
-    Ebpf, EbpfLoader, Pod,
 };
 use aya_obj::generated::BPF_RINGBUF_HDR_SZ;
+use integration_common::ring_buf::Registers;
 use rand::Rng as _;
 use test_log::test;
 use tokio::{
     io::unix::AsyncFd,
-    time::{sleep, Duration},
+    time::{Duration, sleep},
 };
-
-// This structure's definition is duplicated in the probe.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
-struct Registers {
-    dropped: u64,
-    rejected: u64,
-}
-
-impl std::ops::Add for Registers {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self::Output {
-        Self {
-            dropped: self.dropped + rhs.dropped,
-            rejected: self.rejected + rhs.rejected,
-        }
-    }
-}
-
-impl<'a> std::iter::Sum<&'a Registers> for Registers {
-    fn sum<I: Iterator<Item = &'a Registers>>(iter: I) -> Self {
-        iter.fold(Default::default(), |a, b| a + *b)
-    }
-}
-
-unsafe impl Pod for Registers {}
 
 struct RingBufTest {
     _bpf: Ebpf,
@@ -82,9 +57,9 @@ impl RingBufTest {
             .unwrap();
         prog.load().unwrap();
         prog.attach(
-            Some("ring_buf_trigger_ebpf_program"),
-            0,
+            "ring_buf_trigger_ebpf_program",
             "/proc/self/exe",
+            None,
             None,
         )
         .unwrap();
@@ -102,8 +77,8 @@ struct WithData(RingBufTest, Vec<u64>);
 impl WithData {
     fn new(n: usize) -> Self {
         Self(RingBufTest::new(), {
-            let mut rng = rand::thread_rng();
-            std::iter::repeat_with(|| rng.gen()).take(n).collect()
+            let mut rng = rand::rng();
+            std::iter::repeat_with(|| rng.random()).take(n).collect()
         })
     }
 }
@@ -166,7 +141,7 @@ fn ring_buf(n: usize) {
     assert_eq!(rejected, expected_rejected);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[inline(never)]
 pub extern "C" fn ring_buf_trigger_ebpf_program(arg: u64) {
     std::hint::black_box(arg);
@@ -204,8 +179,8 @@ async fn ring_buf_async_with_drops() {
         }
     };
     use futures::future::{
-        select,
         Either::{Left, Right},
+        select,
     };
     let writer = futures::future::try_join_all(data.chunks(8).map(ToOwned::to_owned).map(|v| {
         tokio::spawn(async {
@@ -295,13 +270,17 @@ async fn ring_buf_async_no_drop() {
     ) = WithData::new(RING_BUF_MAX_ENTRIES * 3);
 
     let writer = {
-        let data = data.to_owned();
+        let mut rng = rand::rng();
+        let data: Vec<_> = data
+            .iter()
+            .copied()
+            .map(|value| (value, Duration::from_nanos(rng.random_range(0..10))))
+            .collect();
         tokio::spawn(async move {
-            for value in data {
+            for (value, duration) in data {
                 // Sleep a tad so we feel confident that the consumer will keep up
                 // and no messages will be dropped.
-                let dur = Duration::from_nanos(rand::thread_rng().gen_range(0..10));
-                sleep(dur).await;
+                sleep(duration).await;
                 ring_buf_trigger_ebpf_program(value);
             }
         })

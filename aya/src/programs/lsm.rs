@@ -1,12 +1,13 @@
 //! LSM probes.
 
-use crate::{
+use aya_obj::{
+    btf::{Btf, BtfKind},
     generated::{bpf_attach_type::BPF_LSM_MAC, bpf_prog_type::BPF_PROG_TYPE_LSM},
-    obj::btf::{Btf, BtfKind},
-    programs::{
-        define_link_wrapper, load_program, utils::attach_raw_tracepoint, FdLink, FdLinkId,
-        ProgramData, ProgramError,
-    },
+};
+
+use crate::programs::{
+    FdLink, FdLinkId, ProgramData, ProgramError, ProgramType, define_link_wrapper, load_program,
+    utils::attach_raw_tracepoint,
 };
 
 /// A program that attaches to Linux LSM hooks. Used to implement security policy and
@@ -53,6 +54,9 @@ pub struct Lsm {
 }
 
 impl Lsm {
+    /// The type of the program according to the kernel.
+    pub const PROGRAM_TYPE: ProgramType = ProgramType::Lsm;
+
     /// Loads the program inside the kernel.
     ///
     /// # Arguments
@@ -73,21 +77,6 @@ impl Lsm {
     pub fn attach(&mut self) -> Result<LsmLinkId, ProgramError> {
         attach_raw_tracepoint(&mut self.data, None)
     }
-
-    /// Detaches the program.
-    ///
-    /// See [Lsm::attach].
-    pub fn detach(&mut self, link_id: LsmLinkId) -> Result<(), ProgramError> {
-        self.data.links.remove(link_id)
-    }
-
-    /// Takes ownership of the link referenced by the provided link_id.
-    ///
-    /// The link will be detached on `Drop` and the caller is now responsible
-    /// for managing its lifetime.
-    pub fn take_link(&mut self, link_id: LsmLinkId) -> Result<LsmLink, ProgramError> {
-        self.data.take_link(link_id)
-    }
 }
 
 define_link_wrapper!(
@@ -96,5 +85,6 @@ define_link_wrapper!(
     /// The type returned by [Lsm::attach]. Can be passed to [Lsm::detach].
     LsmLinkId,
     FdLink,
-    FdLinkId
+    FdLinkId,
+    Lsm,
 );

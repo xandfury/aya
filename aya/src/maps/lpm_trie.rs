@@ -6,9 +6,9 @@ use std::{
 };
 
 use crate::{
-    maps::{check_kv_size, IterableMap, MapData, MapError, MapIter, MapKeys},
-    sys::{bpf_map_delete_elem, bpf_map_lookup_elem, bpf_map_update_elem, SyscallError},
     Pod,
+    maps::{IterableMap, MapData, MapError, MapIter, MapKeys, check_kv_size},
+    sys::{SyscallError, bpf_map_delete_elem, bpf_map_lookup_elem, bpf_map_update_elem},
 };
 
 /// A Longest Prefix Match Trie.
@@ -44,7 +44,6 @@ use crate::{
 /// assert_eq!(value, 2);
 /// # Ok::<(), aya::EbpfError>(())
 /// ```
-
 #[doc(alias = "BPF_MAP_TYPE_LPM_TRIE")]
 #[derive(Debug)]
 pub struct LpmTrie<T, K, V> {
@@ -64,7 +63,7 @@ pub struct LpmTrie<T, K, V> {
 /// let ipaddr = Ipv4Addr::new(8,8,8,8);
 /// let key =  Key::new(16, u32::from(ipaddr).to_be());
 /// ```
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct Key<K: Pod> {
     prefix_len: u32,
     data: K,
@@ -128,7 +127,7 @@ impl<T: Borrow<MapData>, K: Pod, V: Pod> LpmTrie<T, K, V> {
     /// Returns a copy of the value associated with the longest prefix matching key in the LpmTrie.
     pub fn get(&self, key: &Key<K>, flags: u64) -> Result<V, MapError> {
         let fd = self.inner.borrow().fd().as_fd();
-        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|(_, io_error)| SyscallError {
+        let value = bpf_map_lookup_elem(fd, key, flags).map_err(|io_error| SyscallError {
             call: "bpf_map_lookup_elem",
             io_error,
         })?;
@@ -157,14 +156,12 @@ impl<T: BorrowMut<MapData>, K: Pod, V: Pod> LpmTrie<T, K, V> {
         flags: u64,
     ) -> Result<(), MapError> {
         let fd = self.inner.borrow().fd().as_fd();
-        bpf_map_update_elem(fd, Some(key), value.borrow(), flags).map_err(|(_, io_error)| {
-            SyscallError {
+        bpf_map_update_elem(fd, Some(key), value.borrow(), flags)
+            .map_err(|io_error| SyscallError {
                 call: "bpf_map_update_elem",
                 io_error,
-            }
-        })?;
-
-        Ok(())
+            })
+            .map_err(Into::into)
     }
 
     /// Removes an element from the map.
@@ -173,14 +170,11 @@ impl<T: BorrowMut<MapData>, K: Pod, V: Pod> LpmTrie<T, K, V> {
     pub fn remove(&mut self, key: &Key<K>) -> Result<(), MapError> {
         let fd = self.inner.borrow().fd().as_fd();
         bpf_map_delete_elem(fd, key)
-            .map(|_| ())
-            .map_err(|(_, io_error)| {
-                SyscallError {
-                    call: "bpf_map_delete_elem",
-                    io_error,
-                }
-                .into()
+            .map_err(|io_error| SyscallError {
+                call: "bpf_map_delete_elem",
+                io_error,
             })
+            .map_err(Into::into)
     }
 }
 
@@ -199,27 +193,26 @@ mod tests {
     use std::{io, net::Ipv4Addr};
 
     use assert_matches::assert_matches;
+    use aya_obj::generated::{
+        bpf_cmd,
+        bpf_map_type::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_LPM_TRIE},
+    };
     use libc::{EFAULT, ENOENT};
 
     use super::*;
     use crate::{
-        generated::{
-            bpf_cmd,
-            bpf_map_type::{BPF_MAP_TYPE_LPM_TRIE, BPF_MAP_TYPE_PERF_EVENT_ARRAY},
-        },
         maps::{
-            test_utils::{self, new_map},
             Map,
+            test_utils::{self, new_map},
         },
-        obj,
-        sys::{override_syscall, SysResult, Syscall},
+        sys::{SysResult, Syscall, override_syscall},
     };
 
-    fn new_obj_map() -> obj::Map {
+    fn new_obj_map() -> aya_obj::Map {
         test_utils::new_obj_map::<Key<u32>>(BPF_MAP_TYPE_LPM_TRIE)
     }
 
-    fn sys_error(value: i32) -> SysResult<i64> {
+    fn sys_error(value: i32) -> SysResult {
         Err((-1, io::Error::from_raw_os_error(value)))
     }
 
@@ -249,10 +242,8 @@ mod tests {
 
     #[test]
     fn test_try_from_wrong_map() {
-        let map = new_map(test_utils::new_obj_map::<u32>(
-            BPF_MAP_TYPE_PERF_EVENT_ARRAY,
-        ));
-        let map = Map::PerfEventArray(map);
+        let map = new_map(test_utils::new_obj_map::<u32>(BPF_MAP_TYPE_ARRAY));
+        let map = Map::Array(map);
 
         assert_matches!(
             LpmTrie::<_, u32, u32>::try_from(&map),
@@ -264,7 +255,7 @@ mod tests {
     fn test_new_ok() {
         let map = new_map(new_obj_map());
 
-        assert!(LpmTrie::<_, u32, u32>::new(&map).is_ok());
+        let _: LpmTrie<_, u32, u32> = LpmTrie::new(&map).unwrap();
     }
 
     #[test]
@@ -272,7 +263,7 @@ mod tests {
         let map = new_map(new_obj_map());
 
         let map = Map::LpmTrie(map);
-        assert!(LpmTrie::<_, u32, u32>::try_from(&map).is_ok())
+        let _: LpmTrie<_, u32, u32> = map.try_into().unwrap();
     }
 
     #[test]
@@ -301,11 +292,11 @@ mod tests {
             Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_MAP_UPDATE_ELEM,
                 ..
-            } => Ok(1),
+            } => Ok(0),
             _ => sys_error(EFAULT),
         });
 
-        assert!(trie.insert(&key, 1, 0).is_ok());
+        assert_matches!(trie.insert(&key, 1, 0), Ok(()));
     }
 
     #[test]
@@ -334,11 +325,11 @@ mod tests {
             Syscall::Ebpf {
                 cmd: bpf_cmd::BPF_MAP_DELETE_ELEM,
                 ..
-            } => Ok(1),
+            } => Ok(0),
             _ => sys_error(EFAULT),
         });
 
-        assert!(trie.remove(&key).is_ok());
+        assert_matches!(trie.remove(&key), Ok(()));
     }
 
     #[test]

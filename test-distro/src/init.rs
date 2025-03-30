@@ -58,6 +58,14 @@ fn run() -> anyhow::Result<()> {
             target_mode: Some(RXRXRX),
         },
         Mount {
+            source: "dev",
+            target: "/dev",
+            fstype: "devtmpfs",
+            flags: nix::mount::MsFlags::empty(),
+            data: None,
+            target_mode: None,
+        },
+        Mount {
             source: "sysfs",
             target: "/sys",
             fstype: "sysfs",
@@ -128,6 +136,7 @@ fn run() -> anyhow::Result<()> {
             let path = entry.path();
             let status = std::process::Command::new(&path)
                 .args(&args)
+                .env("RUST_LOG", "debug")
                 .status()
                 .with_context(|| format!("failed to execute {}", path.display()))?;
 
@@ -137,9 +146,14 @@ fn run() -> anyhow::Result<()> {
                 Err(anyhow::anyhow!("{} failed: {status:?}", path.display()))
             }
         })
-        .filter_map(|result| match result {
-            Ok(()) => None,
-            Err(err) => Some(err),
+        .filter_map(|result| {
+            // TODO(https://github.com/rust-lang/rust-clippy/issues/14112): Remove this allowance
+            // when the lint behaves more sensibly.
+            #[expect(clippy::manual_ok_err)]
+            match result {
+                Ok(()) => None,
+                Err(err) => Some(err),
+            }
         })
         .collect::<Vec<_>>();
     if errors.is_empty() {

@@ -3,6 +3,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     ffi::{CStr, CString},
+    fmt::Display,
     fs::{self, File},
     io::{self, BufRead, BufReader},
     mem,
@@ -11,12 +12,11 @@ use std::{
     str::{FromStr, Utf8Error},
 };
 
-use libc::{if_nametoindex, sysconf, uname, utsname, _SC_PAGESIZE};
+use aya_obj::generated::{TC_H_MAJ_MASK, TC_H_MIN_MASK};
+use libc::{_SC_PAGESIZE, if_nametoindex, sysconf, uname, utsname};
+use log::warn;
 
-use crate::{
-    generated::{TC_H_MAJ_MASK, TC_H_MIN_MASK},
-    Pod,
-};
+use crate::Pod;
 
 /// Represents a kernel version, in major.minor.release version.
 // Adapted from https://docs.rs/procfs/latest/procfs/sys/kernel/struct.Version.html.
@@ -49,7 +49,35 @@ impl KernelVersion {
 
     /// Returns the kernel version of the currently running kernel.
     pub fn current() -> Result<Self, impl Error> {
-        Self::get_kernel_version()
+        thread_local! {
+            // TODO(https://github.com/rust-lang/rust/issues/109737): Use
+            // `std::cell::OnceCell` when `get_or_try_init` is stabilized.
+            static CACHE: once_cell::unsync::OnceCell<KernelVersion> = const { once_cell::unsync::OnceCell::new() };
+        }
+        CACHE.with(|cell| {
+            // TODO(https://github.com/rust-lang/rust/issues/109737): Replace `once_cell` with
+            // `std::cell::OnceCell`.
+            cell.get_or_try_init(|| {
+                // error: unsupported operation: `open` not available when isolation is enabled
+                if cfg!(miri) {
+                    Ok(Self::new(0xff, 0xff, 0xff))
+                } else {
+                    Self::get_kernel_version()
+                }
+            })
+            .copied()
+        })
+    }
+
+    /// Returns true iff the current kernel version is greater than or equal to the given version.
+    pub(crate) fn at_least(major: u8, minor: u8, patch: u16) -> bool {
+        match Self::current() {
+            Ok(current) => current >= Self::new(major, minor, patch),
+            Err(error) => {
+                warn!("failed to get current kernel version: {error}");
+                false
+            }
+        }
     }
 
     /// The equivalent of LINUX_VERSION_CODE.
@@ -177,59 +205,77 @@ impl KernelVersion {
     }
 }
 
-const ONLINE_CPUS: &str = "/sys/devices/system/cpu/online";
-pub(crate) const POSSIBLE_CPUS: &str = "/sys/devices/system/cpu/possible";
+impl Display for KernelVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
 
 /// Returns the numeric IDs of the CPUs currently online.
-pub fn online_cpus() -> Result<Vec<u32>, io::Error> {
-    let data = fs::read_to_string(ONLINE_CPUS)?;
-    parse_cpu_ranges(data.trim()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("unexpected {ONLINE_CPUS} format"),
-        )
-    })
+pub fn online_cpus() -> Result<Vec<u32>, (&'static str, io::Error)> {
+    const ONLINE_CPUS: &str = "/sys/devices/system/cpu/online";
+
+    read_cpu_ranges(ONLINE_CPUS)
 }
 
 /// Get the number of possible cpus.
 ///
 /// See `/sys/devices/system/cpu/possible`.
-pub fn nr_cpus() -> Result<usize, io::Error> {
-    Ok(possible_cpus()?.len())
-}
+pub fn nr_cpus() -> Result<usize, (&'static str, io::Error)> {
+    const POSSIBLE_CPUS: &str = "/sys/devices/system/cpu/possible";
 
-/// Get the list of possible cpus.
-///
-/// See `/sys/devices/system/cpu/possible`.
-pub(crate) fn possible_cpus() -> Result<Vec<u32>, io::Error> {
-    let data = fs::read_to_string(POSSIBLE_CPUS)?;
-    parse_cpu_ranges(data.trim()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("unexpected {POSSIBLE_CPUS} format"),
-        )
+    thread_local! {
+        // TODO(https://github.com/rust-lang/rust/issues/109737): Use
+        // `std::cell::OnceCell` when `get_or_try_init` is stabilized.
+        static CACHE: once_cell::unsync::OnceCell<usize> = const { once_cell::unsync::OnceCell::new() };
+    }
+    CACHE.with(|cell| {
+        // TODO(https://github.com/rust-lang/rust/issues/109737): Replace `once_cell` with
+        // `std::cell::OnceCell`.
+        cell.get_or_try_init(|| {
+            // error: unsupported operation: `open` not available when isolation is enabled
+            if cfg!(miri) {
+                parse_cpu_ranges("0-3").map_err(|error| (POSSIBLE_CPUS, error))
+            } else {
+                read_cpu_ranges(POSSIBLE_CPUS)
+            }
+            .map(|cpus| cpus.len())
+        })
+        .copied()
     })
 }
 
-fn parse_cpu_ranges(data: &str) -> Result<Vec<u32>, ()> {
-    let mut cpus = Vec::new();
-    for range in data.split(',') {
-        cpus.extend({
-            match range
-                .splitn(2, '-')
-                .map(u32::from_str)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| ())?
-                .as_slice()
-            {
-                &[] | &[_, _, _, ..] => return Err(()),
-                &[start] => start..=start,
-                &[start, end] => start..=end,
-            }
-        })
-    }
+fn read_cpu_ranges(path: &'static str) -> Result<Vec<u32>, (&'static str, io::Error)> {
+    (|| {
+        let data = fs::read_to_string(path)?;
+        parse_cpu_ranges(data.trim())
+    })()
+    .map_err(|error| (path, error))
+}
 
-    Ok(cpus)
+fn parse_cpu_ranges(data: &str) -> Result<Vec<u32>, io::Error> {
+    data.split(',')
+        .map(|range| {
+            let mut iter = range
+                .split('-')
+                .map(|s| s.parse::<u32>().map_err(|ParseIntError { .. }| range));
+            let start = iter.next().unwrap()?; // str::split always returns at least one element.
+            let end = match iter.next() {
+                None => start,
+                Some(end) => {
+                    if iter.next().is_some() {
+                        return Err(range);
+                    }
+                    end?
+                }
+            };
+            Ok(start..=end)
+        })
+        .try_fold(Vec::new(), |mut cpus, range| {
+            let range = range.map_err(|range| io::Error::new(io::ErrorKind::InvalidData, range))?;
+            cpus.extend(range);
+            Ok(cpus)
+        })
 }
 
 /// Loads kernel symbols from `/proc/kallsyms`.
@@ -250,6 +296,9 @@ fn parse_kernel_symbols(reader: impl BufRead) -> Result<BTreeMap<u64, String>, i
                 let addr = parts.next()?;
                 let _kind = parts.next()?;
                 let name = parts.next()?;
+                // TODO(https://github.com/rust-lang/rust-clippy/issues/14112): Remove this
+                // allowance when the lint behaves more sensibly.
+                #[expect(clippy::manual_ok_err)]
                 let addr = match u64::from_str_radix(addr, 16) {
                     Ok(addr) => Some(addr),
                     Err(ParseIntError { .. }) => None,
@@ -360,8 +409,8 @@ pub(crate) fn page_size() -> usize {
 
 // bytes_of converts a <T> to a byte slice
 pub(crate) unsafe fn bytes_of<T: Pod>(val: &T) -> &[u8] {
-    let size = mem::size_of::<T>();
-    slice::from_raw_parts(slice::from_ref(val).as_ptr().cast(), size)
+    let ptr: *const _ = val;
+    unsafe { slice::from_raw_parts(ptr.cast(), mem::size_of_val(val)) }
 }
 
 pub(crate) fn bytes_of_slice<T: Pod>(val: &[T]) -> &[u8] {
@@ -423,9 +472,9 @@ mod tests {
             parse_cpu_ranges("0-5,6,7").unwrap(),
             (0..=7).collect::<Vec<_>>()
         );
-        assert!(parse_cpu_ranges("").is_err());
-        assert!(parse_cpu_ranges("0-1,2-").is_err());
-        assert!(parse_cpu_ranges("foo").is_err());
+        assert_matches!(parse_cpu_ranges(""), Err(_));
+        assert_matches!(parse_cpu_ranges("0-1,2-"), Err(_));
+        assert_matches!(parse_cpu_ranges("foo"), Err(_));
     }
 
     #[test]

@@ -1,12 +1,15 @@
 [workspace]
 members = [
     "aya",
+    "aya-build",
     "aya-log",
     "aya-log-common",
     "aya-log-parser",
     "aya-obj",
     "aya-tool",
-    "init",
+    "ebpf-panic",
+    "test-distro",
+    "test/integration-common",
     "test/integration-test",
     "xtask",
 
@@ -25,12 +28,15 @@ resolver = "2"
 
 default-members = [
     "aya",
+    "aya-build",
     "aya-log",
     "aya-log-common",
     "aya-log-parser",
     "aya-obj",
     "aya-tool",
-    "init",
+    "ebpf-panic",
+    "test-distro",
+    "test/integration-common",
     # test/integration-test is omitted; including it in this list causes `cargo test` to run its
     # tests, and that doesn't work unless they've been built with `cargo xtask`.
     "xtask",
@@ -40,15 +46,16 @@ default-members = [
 
     # ebpf crates are omitted; they must be built with:
     # --target bpfe{b,l}-unknown-none
-    # CARGO_CFG_BPF_TARGET_ARCH={x86_64,aarch64,arm,riscv64}
+    # CARGO_CFG_BPF_TARGET_ARCH={x86_64,aarch64,arm,riscv64,powerpc64,s390x,mips}
 ]
 
 [workspace.package]
 authors = ["Aya Contributors"]
+edition = "2024"
+homepage = "https://aya-rs.dev"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aya-rs/aya"
-homepage = "https://aya-rs.dev"
-edition = "2021"
+rust-version = "1.85.0"
 
 # NOTE(vadorovsky): Neither cargo-udeps nor cargo-machete are able to detect
 # unused crates defined in this section. It would be nice to teach either of
@@ -57,54 +64,62 @@ edition = "2021"
 anyhow = { version = "1", default-features = false }
 assert_matches = { version = "1.5.0", default-features = false }
 async-io = { version = "2.0", default-features = false }
-bindgen = { version = "0.69", default-features = false }
+base64 = { version = "0.22.1", default-features = false }
+bindgen = { version = "0.71", default-features = false }
 bitflags = { version = "2.2.1", default-features = false }
 bytes = { version = "1", default-features = false }
-cargo_metadata = { version = "0.18.0", default-features = false }
+cargo_metadata = { version = "0.19.0", default-features = false }
 clap = { version = "4", default-features = false }
 const-assert = { version = "1.0.1", default-features = false }
-core-error = { version = "0.0.0", default-features = false }
 dialoguer = { version = "0.11", default-features = false }
 diff = { version = "0.1.13", default-features = false }
 env_logger = { version = "0.11", default-features = false }
 epoll = { version = "4.3.3", default-features = false }
 futures = { version = "0.3.28", default-features = false }
-hashbrown = { version = "0.14.3", default-features = false }
+glob = { version = "0.3.0", default-features = false }
+hashbrown = { version = "0.15.0", default-features = false }
 indoc = { version = "2.0", default-features = false }
-integration-ebpf = { path = "test/integration-ebpf", default-features = false }
-lazy_static = { version = "1", default-features = false }
 libc = { version = "0.2.105", default-features = false }
 log = { version = "0.4", default-features = false }
 netns-rs = { version = "0.1", default-features = false }
+network-types = { version = "0.0.7", default-features = false }
 nix = { version = "0.29.0", default-features = false }
 num_enum = { version = "0.7", default-features = false }
 object = { version = "0.36", default-features = false }
-proc-macro-error = { version = "1.0", default-features = false }
+octorust = { version = "0.10", default-features = false }
+once_cell = { version = "1.20.1", default-features = false }
 proc-macro2 = { version = "1", default-features = false }
-public-api = { version = "0.36.0", default-features = false }
+proc-macro2-diagnostics = { version = "0.10.1", default-features = false }
+public-api = { version = "0.44.0", default-features = false }
 quote = { version = "1", default-features = false }
-rand = { version = "0.8", default-features = false }
-rbpf = { version = "0.2.0", default-features = false }
+rand = { version = "0.9", default-features = false }
+rbpf = { version = "0.3.0", default-features = false }
 rustdoc-json = { version = "0.9.0", default-features = false }
 rustup-toolchain = { version = "0.1.5", default-features = false }
 rustversion = { version = "1.0.0", default-features = false }
+scopeguard = { version = "1.2.0", default-features = false }
 syn = { version = "2", default-features = false }
 tempfile = { version = "3", default-features = false }
 test-case = { version = "3.1.0", default-features = false }
 test-log = { version = "0.2.13", default-features = false }
 testing_logger = { version = "0.1.1", default-features = false }
-thiserror = { version = "1", default-features = false }
+thiserror = { version = "2.0.3", default-features = false }
 tokio = { version = "1.24.0", default-features = false }
-which = { version = "6.0.0", default-features = false }
-xdpilone = { version = "1.0", default-features = false }
-xtask = { path = "xtask", default-features = false }
+walkdir = { version = "2", default-features = false }
+which = { version = "7.0.0", default-features = false }
+xdpilone = { version = "1.0.5", default-features = false }
+xz2 = { version = "0.1.7", default-features = false }
 
-[profile.dev]
-panic = "abort"
+[workspace.lints.clippy]
+unused_trait_names = "warn"
 
-[profile.release]
-panic = "abort"
+[workspace.lints.rust]
+unused-extern-crates = "warn"
 
 [profile.release.package.integration-ebpf]
-debug = 2
 codegen-units = 1
+debug = 2
+
+[patch.crates-io]
+# TODO: Remove when https://github.com/rust-random/getrandom/commit/b75db5cede302bc9734f5bf2b9048a6e05c7f11e appears in a release.
+getrandom = { git = "https://github.com/rust-random/getrandom.git", rev = "b75db5cede302bc9734f5bf2b9048a6e05c7f11e" }

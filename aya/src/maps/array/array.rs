@@ -5,9 +5,9 @@ use std::{
 };
 
 use crate::{
-    maps::{check_bounds, check_kv_size, IterableMap, MapData, MapError},
-    sys::{bpf_map_lookup_elem, bpf_map_update_elem, SyscallError},
     Pod,
+    maps::{IterableMap, MapData, MapError, check_bounds, check_kv_size},
+    sys::{SyscallError, bpf_map_lookup_elem, bpf_map_update_elem},
 };
 
 /// A fixed-size array.
@@ -49,6 +49,7 @@ impl<T: Borrow<MapData>, V: Pod> Array<T, V> {
     /// Returns the number of elements in the array.
     ///
     /// This corresponds to the value of `bpf_map_def::max_entries` on the eBPF side.
+    #[expect(clippy::len_without_is_empty)]
     pub fn len(&self) -> u32 {
         self.inner.borrow().obj.max_entries()
     }
@@ -64,11 +65,10 @@ impl<T: Borrow<MapData>, V: Pod> Array<T, V> {
         check_bounds(data, *index)?;
         let fd = data.fd().as_fd();
 
-        let value =
-            bpf_map_lookup_elem(fd, index, flags).map_err(|(_, io_error)| SyscallError {
-                call: "bpf_map_lookup_elem",
-                io_error,
-            })?;
+        let value = bpf_map_lookup_elem(fd, index, flags).map_err(|io_error| SyscallError {
+            call: "bpf_map_lookup_elem",
+            io_error,
+        })?;
         value.ok_or(MapError::KeyNotFound)
     }
 
@@ -90,7 +90,7 @@ impl<T: BorrowMut<MapData>, V: Pod> Array<T, V> {
         let data = self.inner.borrow_mut();
         check_bounds(data, index)?;
         let fd = data.fd().as_fd();
-        bpf_map_update_elem(fd, Some(&index), value.borrow(), flags).map_err(|(_, io_error)| {
+        bpf_map_update_elem(fd, Some(&index), value.borrow(), flags).map_err(|io_error| {
             SyscallError {
                 call: "bpf_map_update_elem",
                 io_error,

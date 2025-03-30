@@ -1,21 +1,20 @@
 use std::{
-    ffi::{c_int, CString, OsStr},
+    ffi::{CString, OsStr, c_int},
     io, mem,
-    os::fd::{BorrowedFd, FromRawFd as _, OwnedFd},
+    os::fd::{BorrowedFd, FromRawFd as _},
 };
 
-use libc::pid_t;
-
-use super::{syscall, SysResult, Syscall};
-use crate::generated::{
-    perf_event_attr,
+use aya_obj::generated::{
+    PERF_FLAG_FD_CLOEXEC, perf_event_attr,
     perf_event_sample_format::PERF_SAMPLE_RAW,
     perf_sw_ids::PERF_COUNT_SW_BPF_OUTPUT,
     perf_type_id::{PERF_TYPE_SOFTWARE, PERF_TYPE_TRACEPOINT},
-    PERF_FLAG_FD_CLOEXEC,
 };
+use libc::pid_t;
 
-#[allow(clippy::too_many_arguments)]
+use super::{PerfEventIoctlRequest, Syscall, syscall};
+
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn perf_event_open(
     perf_type: u32,
     config: u64,
@@ -26,7 +25,7 @@ pub(crate) fn perf_event_open(
     wakeup: bool,
     inherit: bool,
     flags: u32,
-) -> SysResult<OwnedFd> {
+) -> io::Result<crate::MockableFd> {
     let mut attr = unsafe { mem::zeroed::<perf_event_attr>() };
 
     attr.config = config;
@@ -46,7 +45,7 @@ pub(crate) fn perf_event_open(
     perf_event_sys(attr, pid, cpu, flags)
 }
 
-pub(crate) fn perf_event_open_bpf(cpu: c_int) -> SysResult<OwnedFd> {
+pub(crate) fn perf_event_open_bpf(cpu: c_int) -> io::Result<crate::MockableFd> {
     perf_event_open(
         PERF_TYPE_SOFTWARE as u32,
         PERF_COUNT_SW_BPF_OUTPUT as u64,
@@ -66,7 +65,7 @@ pub(crate) fn perf_event_open_probe(
     name: &OsStr,
     offset: u64,
     pid: Option<pid_t>,
-) -> SysResult<OwnedFd> {
+) -> io::Result<crate::MockableFd> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let mut attr = unsafe { mem::zeroed::<perf_event_attr>() };
@@ -88,7 +87,10 @@ pub(crate) fn perf_event_open_probe(
     perf_event_sys(attr, pid, cpu, PERF_FLAG_FD_CLOEXEC)
 }
 
-pub(crate) fn perf_event_open_trace_point(id: u32, pid: Option<pid_t>) -> SysResult<OwnedFd> {
+pub(crate) fn perf_event_open_trace_point(
+    id: u32,
+    pid: Option<pid_t>,
+) -> io::Result<crate::MockableFd> {
     let mut attr = unsafe { mem::zeroed::<perf_event_attr>() };
 
     attr.size = mem::size_of::<perf_event_attr>() as u32;
@@ -101,36 +103,47 @@ pub(crate) fn perf_event_open_trace_point(id: u32, pid: Option<pid_t>) -> SysRes
     perf_event_sys(attr, pid, cpu, PERF_FLAG_FD_CLOEXEC)
 }
 
-pub(crate) fn perf_event_ioctl(fd: BorrowedFd<'_>, request: c_int, arg: c_int) -> SysResult<i64> {
-    let call = Syscall::PerfEventIoctl { fd, request, arg };
-    #[cfg(not(test))]
-    return syscall(call);
-
-    #[cfg(test)]
-    return crate::sys::TEST_SYSCALL.with(|test_impl| unsafe { test_impl.borrow()(call) });
+pub(crate) fn perf_event_ioctl(
+    fd: BorrowedFd<'_>,
+    request: PerfEventIoctlRequest<'_>,
+) -> io::Result<()> {
+    syscall(Syscall::PerfEventIoctl { fd, request })
+        .map(|code| {
+            assert_eq!(code, 0);
+        })
+        .map_err(|(code, io_error)| {
+            assert_eq!(code, -1);
+            io_error
+        })
 }
 
-fn perf_event_sys(attr: perf_event_attr, pid: pid_t, cpu: i32, flags: u32) -> SysResult<OwnedFd> {
+fn perf_event_sys(
+    attr: perf_event_attr,
+    pid: pid_t,
+    cpu: i32,
+    flags: u32,
+) -> io::Result<crate::MockableFd> {
     let fd = syscall(Syscall::PerfEventOpen {
         attr,
         pid,
         cpu,
         group: -1,
         flags,
+    })
+    .map_err(|(code, io_error)| {
+        assert_eq!(code, -1);
+        io_error
     })?;
 
-    let fd = fd.try_into().map_err(|_| {
-        (
-            fd,
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("perf_event_open: invalid fd returned: {fd}"),
-            ),
+    let fd = fd.try_into().map_err(|std::num::TryFromIntError { .. }| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("perf_event_open: invalid fd returned: {fd}"),
         )
     })?;
 
     // SAFETY: perf_event_open returns a new file descriptor on success.
-    unsafe { Ok(OwnedFd::from_raw_fd(fd)) }
+    unsafe { Ok(crate::MockableFd::from_raw_fd(fd)) }
 }
 
 /*

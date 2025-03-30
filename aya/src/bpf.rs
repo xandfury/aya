@@ -2,57 +2,45 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fs, io,
-    os::{
-        fd::{AsFd as _, AsRawFd as _, OwnedFd},
-        raw::c_int,
-    },
+    os::fd::{AsFd as _, AsRawFd as _},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use aya_obj::{
-    btf::{BtfFeatures, BtfRelocationError},
-    generated::{BPF_F_SLEEPABLE, BPF_F_XDP_HAS_FRAGS},
+    EbpfSectionKind, Features, Object, ParseError, ProgramSection,
+    btf::{Btf, BtfError, BtfFeatures, BtfRelocationError},
+    generated::{
+        BPF_F_SLEEPABLE, BPF_F_XDP_HAS_FRAGS,
+        bpf_map_type::{self, *},
+    },
     relocation::EbpfRelocationError,
-    EbpfSectionKind, Features,
 };
 use log::{debug, warn};
 use thiserror::Error;
 
 use crate::{
-    generated::{
-        bpf_map_type, bpf_map_type::*, AYA_PERF_EVENT_IOC_DISABLE, AYA_PERF_EVENT_IOC_ENABLE,
-        AYA_PERF_EVENT_IOC_SET_BPF,
-    },
     maps::{Map, MapData, MapError},
-    obj::{
-        btf::{Btf, BtfError},
-        Object, ParseError, ProgramSection,
-    },
     programs::{
         BtfTracePoint, CgroupDevice, CgroupSkb, CgroupSkbAttachType, CgroupSock, CgroupSockAddr,
-        CgroupSockopt, CgroupSysctl, Extension, FEntry, FExit, KProbe, LircMode2, Lsm, PerfEvent,
-        ProbeKind, Program, ProgramData, ProgramError, RawTracePoint, SchedClassifier, SkLookup,
-        SkMsg, SkSkb, SkSkbKind, SockOps, SocketFilter, TracePoint, UProbe, Xdp,
+        CgroupSockopt, CgroupSysctl, Extension, FEntry, FExit, FlowDissector, Iter, KProbe,
+        LircMode2, Lsm, PerfEvent, ProbeKind, Program, ProgramData, ProgramError, RawTracePoint,
+        SchedClassifier, SkLookup, SkMsg, SkSkb, SkSkbKind, SockOps, SocketFilter, TracePoint,
+        UProbe, Xdp,
     },
     sys::{
         bpf_load_btf, is_bpf_cookie_supported, is_bpf_global_data_supported,
         is_btf_datasec_supported, is_btf_decl_tag_supported, is_btf_enum64_supported,
         is_btf_float_supported, is_btf_func_global_supported, is_btf_func_supported,
-        is_btf_supported, is_btf_type_tag_supported, is_perf_link_supported,
-        is_probe_read_kernel_supported, is_prog_id_supported, is_prog_name_supported,
-        retry_with_verifier_logs,
+        is_btf_supported, is_btf_type_tag_supported, is_info_gpl_compatible_supported,
+        is_info_map_ids_supported, is_perf_link_supported, is_probe_read_kernel_supported,
+        is_prog_id_supported, is_prog_name_supported, retry_with_verifier_logs,
     },
-    util::{bytes_of, bytes_of_slice, page_size, possible_cpus, POSSIBLE_CPUS},
+    util::{bytes_of, bytes_of_slice, nr_cpus, page_size},
 };
 
-pub(crate) const BPF_OBJ_NAME_LEN: usize = 16;
-
-pub(crate) const PERF_EVENT_IOC_ENABLE: c_int = AYA_PERF_EVENT_IOC_ENABLE;
-pub(crate) const PERF_EVENT_IOC_DISABLE: c_int = AYA_PERF_EVENT_IOC_DISABLE;
-pub(crate) const PERF_EVENT_IOC_SET_BPF: c_int = AYA_PERF_EVENT_IOC_SET_BPF;
-
 /// Marker trait for types that can safely be converted to and from byte slices.
+#[expect(clippy::missing_safety_doc)]
 pub unsafe trait Pod: Copy + 'static {}
 
 macro_rules! unsafe_impl_pod {
@@ -68,11 +56,9 @@ unsafe_impl_pod!(i8, u8, i16, u16, i32, u32, i64, u64, u128, i128);
 // It only makes sense that an array of POD types is itself POD
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 
-pub use aya_obj::maps::{bpf_map_def, PinningType};
+pub use aya_obj::maps::{PinningType, bpf_map_def};
 
-lazy_static::lazy_static! {
-    pub(crate) static ref FEATURES: Features = detect_features();
-}
+pub(crate) static FEATURES: LazyLock<Features> = LazyLock::new(detect_features);
 
 fn detect_features() -> Features {
     let btf = if is_btf_supported() {
@@ -96,6 +82,8 @@ fn detect_features() -> Features {
         is_bpf_cookie_supported(),
         is_prog_id_supported(BPF_MAP_TYPE_CPUMAP),
         is_prog_id_supported(BPF_MAP_TYPE_DEVMAP),
+        is_info_map_ids_supported(),
+        is_info_gpl_compatible_supported(),
         btf,
     );
     debug!("BPF Feature Detection: {:#?}", f);
@@ -252,17 +240,17 @@ impl<'a> EbpfLoader<'a> {
     /// From Rust eBPF, a global variable can be defined as follows:
     ///
     /// ```no_run
-    /// #[no_mangle]
+    /// #[unsafe(no_mangle)]
     /// static VERSION: i32 = 0;
     /// ```
     ///
     /// Then it can be accessed using `core::ptr::read_volatile`:
     ///
     /// ```no_run
-    /// # #[no_mangle]
+    /// # #[unsafe(no_mangle)]
     /// # static VERSION: i32 = 0;
-    /// # unsafe fn try_test() {
-    /// let version = core::ptr::read_volatile(&VERSION);
+    /// # fn try_test() {
+    /// let version = unsafe { core::ptr::read_volatile(&VERSION) };
     /// # }
     /// ```
     ///
@@ -375,6 +363,10 @@ impl<'a> EbpfLoader<'a> {
 
     /// Loads eBPF bytecode from a buffer.
     ///
+    /// The buffer needs to be 4-bytes aligned. If you are bundling the bytecode statically
+    /// into your binary, it is recommended that you do so using
+    /// [`include_bytes_aligned`](crate::include_bytes_aligned).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -410,8 +402,9 @@ impl<'a> EbpfLoader<'a> {
                                 | ProgramSection::FEntry { sleepable: _ }
                                 | ProgramSection::FExit { sleepable: _ }
                                 | ProgramSection::Lsm { sleepable: _ }
-                                | ProgramSection::BtfTracePoint => {
-                                    return Err(EbpfError::BtfError(err))
+                                | ProgramSection::BtfTracePoint
+                                | ProgramSection::Iter { sleepable: _ } => {
+                                    return Err(EbpfError::BtfError(err));
                                 }
                                 ProgramSection::KRetProbe
                                 | ProgramSection::KProbe
@@ -438,6 +431,7 @@ impl<'a> EbpfLoader<'a> {
                                 | ProgramSection::PerfEvent
                                 | ProgramSection::RawTracePoint
                                 | ProgramSection::SkLookup
+                                | ProgramSection::FlowDissector
                                 | ProgramSection::CgroupSock { attach_type: _ }
                                 | ProgramSection::CgroupDevice => {}
                             }
@@ -465,13 +459,11 @@ impl<'a> EbpfLoader<'a> {
             {
                 continue;
             }
-            let num_cpus = || -> Result<u32, EbpfError> {
-                Ok(possible_cpus()
-                    .map_err(|error| EbpfError::FileError {
-                        path: PathBuf::from(POSSIBLE_CPUS),
-                        error,
-                    })?
-                    .len() as u32)
+            let num_cpus = || {
+                Ok(nr_cpus().map_err(|(path, error)| EbpfError::FileError {
+                    path: PathBuf::from(path),
+                    error,
+                })? as u32)
             };
             let map_type: bpf_map_type = obj.map_type().try_into().map_err(MapError::from)?;
             if let Some(max_entries) = max_entries_override(
@@ -529,15 +521,11 @@ impl<'a> EbpfLoader<'a> {
             .map(|(name, prog_obj)| {
                 let function_obj = obj.functions.get(&prog_obj.function_key()).unwrap().clone();
 
-                let prog_name = if FEATURES.bpf_name() {
-                    Some(name.clone())
-                } else {
-                    None
-                };
+                let prog_name = FEATURES.bpf_name().then(|| name.clone().into());
                 let section = prog_obj.section.clone();
                 let obj = (prog_obj, function_obj);
 
-                let btf_fd = btf_fd.clone();
+                let btf_fd = btf_fd.as_ref().map(Arc::clone);
                 let program = if extensions.contains(name.as_str()) {
                     Program::Extension(Extension {
                         data: ProgramData::new(prog_name, obj, btf_fd, *verifier_log_level),
@@ -623,15 +611,15 @@ impl<'a> EbpfLoader<'a> {
                         }
                         ProgramSection::CgroupSkb => Program::CgroupSkb(CgroupSkb {
                             data: ProgramData::new(prog_name, obj, btf_fd, *verifier_log_level),
-                            expected_attach_type: None,
+                            attach_type: None,
                         }),
                         ProgramSection::CgroupSkbIngress => Program::CgroupSkb(CgroupSkb {
                             data: ProgramData::new(prog_name, obj, btf_fd, *verifier_log_level),
-                            expected_attach_type: Some(CgroupSkbAttachType::Ingress),
+                            attach_type: Some(CgroupSkbAttachType::Ingress),
                         }),
                         ProgramSection::CgroupSkbEgress => Program::CgroupSkb(CgroupSkb {
                             data: ProgramData::new(prog_name, obj, btf_fd, *verifier_log_level),
-                            expected_attach_type: Some(CgroupSkbAttachType::Egress),
+                            attach_type: Some(CgroupSkbAttachType::Egress),
                         }),
                         ProgramSection::CgroupSockAddr { attach_type, .. } => {
                             Program::CgroupSockAddr(CgroupSockAddr {
@@ -675,6 +663,9 @@ impl<'a> EbpfLoader<'a> {
                             }
                             Program::FExit(FExit { data })
                         }
+                        ProgramSection::FlowDissector => Program::FlowDissector(FlowDissector {
+                            data: ProgramData::new(prog_name, obj, btf_fd, *verifier_log_level),
+                        }),
                         ProgramSection::Extension => Program::Extension(Extension {
                             data: ProgramData::new(prog_name, obj, btf_fd, *verifier_log_level),
                         }),
@@ -690,6 +681,14 @@ impl<'a> EbpfLoader<'a> {
                         ProgramSection::CgroupDevice => Program::CgroupDevice(CgroupDevice {
                             data: ProgramData::new(prog_name, obj, btf_fd, *verifier_log_level),
                         }),
+                        ProgramSection::Iter { sleepable } => {
+                            let mut data =
+                                ProgramData::new(prog_name, obj, btf_fd, *verifier_log_level);
+                            if *sleepable {
+                                data.flags = BPF_F_SLEEPABLE;
+                            }
+                            Program::Iter(Iter { data })
+                        }
                     }
                 };
                 (name, program)
@@ -697,23 +696,17 @@ impl<'a> EbpfLoader<'a> {
             .collect();
         let maps = maps
             .drain()
-            .map(parse_map)
+            .map(|data| parse_map(data, *allow_unsupported_maps))
             .collect::<Result<HashMap<String, Map>, EbpfError>>()?;
-
-        if !*allow_unsupported_maps {
-            maps.iter().try_for_each(|(_, x)| match x {
-                Map::Unsupported(map) => Err(EbpfError::MapError(MapError::Unsupported {
-                    map_type: map.obj().map_type(),
-                })),
-                _ => Ok(()),
-            })?;
-        };
 
         Ok(Ebpf { maps, programs })
     }
 }
 
-fn parse_map(data: (String, MapData)) -> Result<(String, Map), EbpfError> {
+fn parse_map(
+    data: (String, MapData),
+    allow_unsupported_maps: bool,
+) -> Result<(String, Map), EbpfError> {
     let (name, map) = data;
     let map_type = bpf_map_type::try_from(map.obj().map_type()).map_err(MapError::from)?;
     let map = match map_type {
@@ -737,9 +730,15 @@ fn parse_map(data: (String, MapData)) -> Result<(String, Map), EbpfError> {
         BPF_MAP_TYPE_DEVMAP => Map::DevMap(map),
         BPF_MAP_TYPE_DEVMAP_HASH => Map::DevMapHash(map),
         BPF_MAP_TYPE_XSKMAP => Map::XskMap(map),
-        m => {
-            warn!("The map {name} is of type {:#?} which is currently unsupported in Aya, use `allow_unsupported_maps()` to load it anyways", m);
-            Map::Unsupported(map)
+        m_type => {
+            if allow_unsupported_maps {
+                Map::Unsupported(map)
+            } else {
+                return Err(EbpfError::MapError(MapError::Unsupported {
+                    name,
+                    map_type: m_type,
+                }));
+            }
         }
     };
 
@@ -780,11 +779,7 @@ fn adjust_to_page_size(byte_size: u32, page_size: u32) -> u32 {
     fn div_ceil(n: u32, rhs: u32) -> u32 {
         let d = n / rhs;
         let r = n % rhs;
-        if r > 0 && rhs > 0 {
-            d + 1
-        } else {
-            d
-        }
+        if r > 0 && rhs > 0 { d + 1 } else { d }
     }
     let pages_needed = div_ceil(byte_size, page_size);
     page_size * pages_needed.next_power_of_two()
@@ -792,7 +787,7 @@ fn adjust_to_page_size(byte_size: u32, page_size: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::generated::bpf_map_type::*;
+    use aya_obj::generated::bpf_map_type::*;
 
     const PAGE_SIZE: u32 = 4096;
     const NUM_CPUS: u32 = 4;
@@ -890,6 +885,10 @@ impl Ebpf {
     /// Parses the object code contained in `data` and initializes the
     /// [maps](crate::maps) defined in it. If the kernel supports [BTF](Btf)
     /// debug info, it is automatically loaded from `/sys/kernel/btf/vmlinux`.
+    ///
+    /// The buffer needs to be 4-bytes aligned. If you are bundling the bytecode statically
+    /// into your binary, it is recommended that you do so using
+    /// [`include_bytes_aligned`](crate::include_bytes_aligned).
     ///
     /// For more loading options, see [EbpfLoader].
     ///
@@ -1021,7 +1020,7 @@ impl Ebpf {
     ///
     /// let program: &mut UProbe = bpf.program_mut("SSL_read").unwrap().try_into()?;
     /// program.load()?;
-    /// program.attach(Some("SSL_read"), 0, "libssl", None)?;
+    /// program.attach("SSL_read", "libssl", None, None)?;
     /// # Ok::<(), aya::EbpfError>(())
     /// ```
     pub fn program_mut(&mut self, name: &str) -> Option<&mut Program> {
@@ -1123,11 +1122,14 @@ pub enum EbpfError {
 #[deprecated(since = "0.13.0", note = "use `EbpfError` instead")]
 pub type BpfError = EbpfError;
 
-fn load_btf(raw_btf: Vec<u8>, verifier_log_level: VerifierLogLevel) -> Result<OwnedFd, BtfError> {
+fn load_btf(
+    raw_btf: Vec<u8>,
+    verifier_log_level: VerifierLogLevel,
+) -> Result<crate::MockableFd, BtfError> {
     let (ret, verifier_log) = retry_with_verifier_logs(10, |logger| {
         bpf_load_btf(raw_btf.as_slice(), logger, verifier_log_level)
     });
-    ret.map_err(|(_, io_error)| BtfError::LoadError {
+    ret.map_err(|io_error| BtfError::LoadError {
         io_error,
         verifier_log,
     })

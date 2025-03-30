@@ -6,23 +6,18 @@
 
 use std::{
     borrow::Borrow,
-    ffi::{c_int, c_void},
     fmt::{self, Debug, Formatter},
-    io, mem,
+    mem,
     ops::Deref,
     os::fd::{AsFd as _, AsRawFd, BorrowedFd, RawFd},
-    ptr,
-    ptr::NonNull,
-    slice,
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
-use libc::{munmap, off_t, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
+use aya_obj::generated::{BPF_RINGBUF_BUSY_BIT, BPF_RINGBUF_DISCARD_BIT, BPF_RINGBUF_HDR_SZ};
+use libc::{MAP_SHARED, PROT_READ, PROT_WRITE};
 
 use crate::{
-    generated::{BPF_RINGBUF_BUSY_BIT, BPF_RINGBUF_DISCARD_BIT, BPF_RINGBUF_HDR_SZ},
-    maps::{MapData, MapError},
-    sys::{mmap, SyscallError},
+    maps::{MMap, MapData, MapError},
     util::page_size,
 };
 
@@ -35,7 +30,7 @@ use crate::{
 ///   reasons. By default, a notification will be sent if the consumer is caught up at the time of
 ///   committing. The eBPF program can use the `BPF_RB_NO_WAKEUP` or `BPF_RB_FORCE_WAKEUP` flags to
 ///   control this behavior.
-/// * On the eBPF side, it supports the reverse-commit pattern where the event can be directly
+/// * On the eBPF side, it supports the reserve-commit pattern where the event can be directly
 ///   written into the ring without copying from a temporary location.
 /// * Dropped sample notifications go to the eBPF program as the return value of `reserve`/`output`,
 ///   and not the userspace reader. This might require extra code to handle, but allows for more
@@ -126,7 +121,7 @@ impl<T> RingBuf<T> {
     // lifetime of the iterator in the returned `RingBufItem`. If the Iterator::Item leveraged GATs,
     // one could imagine an implementation of `Iterator` that would work. GATs are stabilized in
     // Rust 1.65, but there's not yet a trait that the community seems to have standardized around.
-    #[allow(clippy::should_implement_trait)]
+    #[expect(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<RingBufItem<'_>> {
         let Self {
             consumer, producer, ..
@@ -317,11 +312,11 @@ impl ProducerData {
     }
 
     fn next<'a>(&'a mut self, consumer: &'a mut ConsumerPos) -> Option<RingBufItem<'a>> {
-        let Self {
+        let &mut Self {
             ref mmap,
-            data_offset,
-            pos_cache,
-            mask,
+            ref mut data_offset,
+            ref mut pos_cache,
+            ref mut mask,
         } = self;
         let pos = unsafe { mmap.ptr.cast().as_ref() };
         let mmap_data = mmap.as_ref();
@@ -401,63 +396,5 @@ impl ProducerData {
                 }
             }
         }
-    }
-}
-
-// MMap corresponds to a memory-mapped region.
-//
-// The data is unmapped in Drop.
-struct MMap {
-    ptr: NonNull<c_void>,
-    len: usize,
-}
-
-// Needed because NonNull<T> is !Send and !Sync out of caution that the data
-// might be aliased unsafely.
-unsafe impl Send for MMap {}
-unsafe impl Sync for MMap {}
-
-impl MMap {
-    fn new(
-        fd: BorrowedFd<'_>,
-        len: usize,
-        prot: c_int,
-        flags: c_int,
-        offset: off_t,
-    ) -> Result<Self, MapError> {
-        match unsafe { mmap(ptr::null_mut(), len, prot, flags, fd, offset) } {
-            MAP_FAILED => Err(MapError::SyscallError(SyscallError {
-                call: "mmap",
-                io_error: io::Error::last_os_error(),
-            })),
-            ptr => Ok(Self {
-                ptr: NonNull::new(ptr).ok_or(
-                    // This should never happen, but to be paranoid, and so we never need to talk
-                    // about a null pointer, we check it anyway.
-                    MapError::SyscallError(SyscallError {
-                        call: "mmap",
-                        io_error: io::Error::new(
-                            io::ErrorKind::Other,
-                            "mmap returned null pointer",
-                        ),
-                    }),
-                )?,
-                len,
-            }),
-        }
-    }
-}
-
-impl AsRef<[u8]> for MMap {
-    fn as_ref(&self) -> &[u8] {
-        let Self { ptr, len } = self;
-        unsafe { slice::from_raw_parts(ptr.as_ptr().cast(), *len) }
-    }
-}
-
-impl Drop for MMap {
-    fn drop(&mut self) {
-        let Self { ptr, len } = *self;
-        unsafe { munmap(ptr.as_ptr(), len) };
     }
 }

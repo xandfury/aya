@@ -2,7 +2,7 @@ use alloc::{
     borrow::{Cow, ToOwned as _},
     collections::BTreeMap,
     format,
-    string::{String, ToString},
+    string::{String, ToString as _},
     vec,
     vec::Vec,
 };
@@ -10,19 +10,17 @@ use core::{mem, ops::Bound::Included, ptr};
 
 use object::SectionIndex;
 
-#[cfg(not(feature = "std"))]
-use crate::std;
 use crate::{
+    Function, Object,
     btf::{
-        fields_are_compatible, types_are_compatible, Array, Btf, BtfError, BtfMember, BtfType,
-        IntEncoding, Struct, Union, MAX_SPEC_LEN,
+        Array, Btf, BtfError, BtfMember, BtfType, IntEncoding, MAX_SPEC_LEN, Struct, Union,
+        fields_are_compatible, types_are_compatible,
     },
     generated::{
-        bpf_core_relo, bpf_core_relo_kind::*, bpf_insn, BPF_ALU, BPF_ALU64, BPF_B, BPF_CALL,
-        BPF_DW, BPF_H, BPF_JMP, BPF_K, BPF_LD, BPF_LDX, BPF_ST, BPF_STX, BPF_W, BTF_INT_SIGNED,
+        BPF_ALU, BPF_ALU64, BPF_B, BPF_CALL, BPF_DW, BPF_H, BPF_JMP, BPF_K, BPF_LD, BPF_LDX,
+        BPF_ST, BPF_STX, BPF_W, BTF_INT_SIGNED, bpf_core_relo, bpf_core_relo_kind::*, bpf_insn,
     },
     util::HashMap,
-    Function, Object,
 };
 
 /// The error type returned by [`Object::relocate_btf`].
@@ -60,7 +58,9 @@ enum RelocationError {
     },
 
     /// Invalid instruction index referenced by relocation
-    #[error("invalid instruction index #{index} referenced by relocation #{relocation_number}, the program contains {num_instructions} instructions")]
+    #[error(
+        "invalid instruction index #{index} referenced by relocation #{relocation_number}, the program contains {num_instructions} instructions"
+    )]
     InvalidInstructionIndex {
         /// The invalid instruction index
         index: usize,
@@ -71,7 +71,9 @@ enum RelocationError {
     },
 
     /// Multiple candidate target types found with different memory layouts
-    #[error("error relocating {type_name}, multiple candidate target types found with different memory layouts: {candidates:?}")]
+    #[error(
+        "error relocating {type_name}, multiple candidate target types found with different memory layouts: {candidates:?}"
+    )]
     ConflictingCandidates {
         /// The type name
         type_name: String,
@@ -129,7 +131,9 @@ enum RelocationError {
         error: Cow<'static, str>,
     },
 
-    #[error("applying relocation `{kind:?}` missing target BTF info for type `{type_id}` at instruction #{ins_index}")]
+    #[error(
+        "applying relocation `{kind:?}` missing target BTF info for type `{type_id}` at instruction #{ins_index}"
+    )]
     MissingTargetDefinition {
         kind: RelocationKind,
         type_id: u32,
@@ -196,7 +200,6 @@ pub(crate) struct Relocation {
 }
 
 impl Relocation {
-    #[allow(unused_unsafe)]
     pub(crate) unsafe fn parse(data: &[u8], number: usize) -> Result<Relocation, BtfError> {
         if mem::size_of::<bpf_core_relo>() > data.len() {
             return Err(BtfError::InvalidRelocationInfo);
@@ -248,12 +251,12 @@ impl Object {
                 target_btf,
                 &mut candidates_cache,
             ) {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(error) => {
                     return Err(BtfRelocationError {
                         section: section_name.to_string(),
                         error,
-                    })
+                    });
                 }
             }
         }
@@ -751,7 +754,7 @@ impl<'a> AccessSpec<'a> {
                         relocation_kind: format!("{:?}", relocation.kind),
                         type_kind: format!("{:?}", ty.kind()),
                         error: "enum relocation on non-enum type",
-                    })
+                    });
                 }
             },
 
@@ -1006,7 +1009,7 @@ impl ComputedRelocation {
                                     target.size,
                                 )
                                 .into(),
-                            })
+                            });
                         }
                     }
 
@@ -1020,7 +1023,7 @@ impl ComputedRelocation {
                                 relocation_number: rel.number,
                                 index: ins_index,
                                 error: format!("invalid target size {size}").into(),
-                            })
+                            });
                         }
                     } as u8;
                     ins.code = ins.code & 0xE0 | size | ins.code & 0x07;
@@ -1043,7 +1046,7 @@ impl ComputedRelocation {
                     relocation_number: rel.number,
                     index: ins_index,
                     error: format!("invalid instruction class {class:x}").into(),
-                })
+                });
             }
         };
 
@@ -1070,7 +1073,7 @@ impl ComputedRelocation {
                     }
                     BtfType::Enum64(en) => {
                         let variant = &en.variants[accessor.index];
-                        (variant.value_high as u64) << 32 | variant.value_low as u64
+                        ((variant.value_high as u64) << 32) | variant.value_low as u64
                     }
                     // candidate selection ensures that rel_kind == local_kind == target_kind
                     _ => unreachable!(),
@@ -1191,7 +1194,6 @@ impl ComputedRelocation {
             type_id: None,
         };
 
-        #[allow(clippy::wildcard_in_or_patterns)]
         match rel.kind {
             FieldByteOffset => {
                 value.value = byte_off as u64;
@@ -1209,13 +1211,12 @@ impl ComputedRelocation {
                 BtfType::Int(i) => value.value = i.encoding() as u64 & IntEncoding::Signed as u64,
                 _ => (),
             },
-            #[cfg(target_endian = "little")]
             FieldLShift64 => {
-                value.value = 64 - (bit_off + bit_size - byte_off * 8) as u64;
-            }
-            #[cfg(target_endian = "big")]
-            FieldLShift64 => {
-                value.value = (8 - byte_size) * 8 + (bit_off - byte_off * 8);
+                value.value = if cfg!(target_endian = "little") {
+                    64 - (bit_off + bit_size - byte_off * 8) as u64
+                } else {
+                    ((8 - byte_size) * 8 + (bit_off - byte_off * 8)) as u64
+                }
             }
             FieldRShift64 => {
                 value.value = 64 - bit_size as u64;

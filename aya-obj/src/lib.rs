@@ -66,27 +66,21 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(clippy::all, missing_docs)]
-#![allow(clippy::missing_safety_doc, clippy::len_without_is_empty)]
 
 extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
-#[cfg(not(feature = "std"))]
-mod std {
-    pub mod error {
-        pub use core_error::Error;
-    }
-    pub use core::*;
-
-    pub mod os {
-        pub mod fd {
-            pub type RawFd = core::ffi::c_int;
-        }
-    }
-}
 
 pub mod btf;
+#[expect(
+    clippy::all,
+    missing_docs,
+    non_camel_case_types,
+    non_snake_case,
+    unsafe_op_in_unsafe_fn
+)]
 pub mod generated;
+pub mod links;
 pub mod maps;
 pub mod obj;
 pub mod programs;
@@ -108,15 +102,15 @@ impl VerifierLog {
     }
 }
 
-impl std::fmt::Debug for VerifierLog {
+impl core::fmt::Debug for VerifierLog {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let Self(log) = self;
         f.write_str(log)
     }
 }
 
-impl std::fmt::Display for VerifierLog {
+impl core::fmt::Display for VerifierLog {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        <Self as std::fmt::Debug>::fmt(self, f)
+        <Self as core::fmt::Debug>::fmt(self, f)
     }
 }
