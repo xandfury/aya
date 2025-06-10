@@ -60,9 +60,7 @@ use std::{
 };
 
 use aya_obj::{EbpfSectionKind, InvalidTypeBinding, generated::bpf_map_type, parse_map_info};
-use libc::{
-    MAP_FAILED, RLIM_INFINITY, RLIMIT_MEMLOCK, c_int, c_void, getrlimit, off_t, rlim_t, rlimit,
-};
+use libc::{RLIM_INFINITY, RLIMIT_MEMLOCK, getrlimit, rlim_t, rlimit};
 use log::warn;
 use thiserror::Error;
 
@@ -71,7 +69,7 @@ use crate::{
     pin::PinError,
     sys::{
         SyscallError, bpf_create_map, bpf_get_object, bpf_map_freeze, bpf_map_get_fd_by_id,
-        bpf_map_get_next_key, bpf_map_update_elem_ptr, bpf_pin_object, mmap, munmap,
+        bpf_map_get_next_key, bpf_map_update_elem_ptr, bpf_pin_object,
     },
     util::{KernelVersion, nr_cpus},
 };
@@ -254,7 +252,7 @@ fn maybe_warn_rlimit() {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let &Self(size) = self;
                 if size < 1024 {
-                    write!(f, "{} bytes", size)
+                    write!(f, "{size} bytes")
                 } else if size < 1024 * 1024 {
                     write!(f, "{} KiB", size / 1024)
                 } else {
@@ -944,62 +942,6 @@ impl<T: Pod> Deref for PerCpuValues<T> {
     }
 }
 
-// MMap corresponds to a memory-mapped region.
-//
-// The data is unmapped in Drop.
-#[cfg_attr(test, derive(Debug))]
-struct MMap {
-    ptr: ptr::NonNull<c_void>,
-    len: usize,
-}
-
-// Needed because NonNull<T> is !Send and !Sync out of caution that the data
-// might be aliased unsafely.
-unsafe impl Send for MMap {}
-unsafe impl Sync for MMap {}
-
-impl MMap {
-    fn new(
-        fd: BorrowedFd<'_>,
-        len: usize,
-        prot: c_int,
-        flags: c_int,
-        offset: off_t,
-    ) -> Result<Self, SyscallError> {
-        match unsafe { mmap(ptr::null_mut(), len, prot, flags, fd, offset) } {
-            MAP_FAILED => Err(SyscallError {
-                call: "mmap",
-                io_error: io::Error::last_os_error(),
-            }),
-            ptr => {
-                let ptr = ptr::NonNull::new(ptr).ok_or(
-                    // This should never happen, but to be paranoid, and so we never need to talk
-                    // about a null pointer, we check it anyway.
-                    SyscallError {
-                        call: "mmap",
-                        io_error: io::Error::other("mmap returned null pointer"),
-                    },
-                )?;
-                Ok(Self { ptr, len })
-            }
-        }
-    }
-}
-
-impl AsRef<[u8]> for MMap {
-    fn as_ref(&self) -> &[u8] {
-        let Self { ptr, len } = self;
-        unsafe { std::slice::from_raw_parts(ptr.as_ptr().cast(), *len) }
-    }
-}
-
-impl Drop for MMap {
-    fn drop(&mut self) {
-        let Self { ptr, len } = *self;
-        unsafe { munmap(ptr.as_ptr(), len) };
-    }
-}
-
 #[cfg(test)]
 mod test_utils {
     use aya_obj::{
@@ -1020,7 +962,7 @@ mod test_utils {
                 cmd: bpf_cmd::BPF_MAP_CREATE,
                 ..
             } => Ok(crate::MockableFd::mock_signed_fd().into()),
-            call => panic!("unexpected syscall {:?}", call),
+            call => panic!("unexpected syscall {call:?}"),
         });
         MapData::create(obj, "foo", None).unwrap()
     }

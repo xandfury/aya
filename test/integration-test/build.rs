@@ -2,13 +2,13 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
 };
 
 use anyhow::{Context as _, Ok, Result, anyhow};
 use aya_build::cargo_metadata::{Metadata, MetadataCommand, Package, Target, TargetKind};
-use xtask::{AYA_BUILD_INTEGRATION_BPF, LIBBPF_DIR, exec};
+use xtask::{AYA_BUILD_INTEGRATION_BPF, LIBBPF_DIR, exec, install_libbpf_headers_cmd};
 
 /// This file, along with the xtask crate, allows analysis tools such as `cargo check`, `cargo
 /// clippy`, and even `cargo build` to work as users expect. Prior to this file's existence, this
@@ -52,7 +52,7 @@ fn main() -> Result<()> {
         .context("MetadataCommand::exec")?;
     let integration_ebpf_package = packages
         .into_iter()
-        .find(|Package { name, .. }| name == "integration-ebpf")
+        .find(|Package { name, .. }| name.as_str() == "integration-ebpf")
         .ok_or_else(|| anyhow!("integration-ebpf package not found"))?;
 
     let manifest_dir =
@@ -66,10 +66,21 @@ fn main() -> Result<()> {
         ("iter.bpf.c", true),
         ("main.bpf.c", false),
         ("multimap-btf.bpf.c", false),
-        ("reloc.bpf.c", true),
+        ("enum_signed_32_checked_variants_reloc.bpf.c", true),
+        ("enum_signed_32_reloc.bpf.c", true),
+        ("enum_signed_64_checked_variants_reloc.bpf.c", true),
+        ("enum_signed_64_reloc.bpf.c", true),
+        ("enum_unsigned_32_checked_variants_reloc.bpf.c", true),
+        ("enum_unsigned_32_reloc.bpf.c", true),
+        ("enum_unsigned_64_checked_variants_reloc.bpf.c", true),
+        ("enum_unsigned_64_reloc.bpf.c", true),
+        ("field_reloc.bpf.c", true),
+        ("pointer_reloc.bpf.c", true),
+        ("struct_flavors_reloc.bpf.c", true),
         ("text_64_64_reloc.c", false),
         ("variables_reloc.bpf.c", false),
     ];
+    const C_BPF_HEADERS: &[&str] = &["reloc.h", "struct_with_scalars.h"];
 
     if build_integration_bpf {
         let endian = env::var_os("CARGO_CFG_TARGET_ENDIAN")
@@ -86,18 +97,9 @@ fn main() -> Result<()> {
         println!("cargo:rerun-if-changed={libbpf_dir}");
 
         let libbpf_headers_dir = out_dir.join("libbpf_headers");
-
-        let mut includedir = OsString::new();
-        includedir.push("INCLUDEDIR=");
-        includedir.push(&libbpf_headers_dir);
-
-        exec(
-            Command::new("make")
-                .arg("-C")
-                .arg(libbpf_dir.join("src"))
-                .arg(includedir)
-                .arg("install_headers"),
-        )?;
+        let mut cmd = install_libbpf_headers_cmd(&libbpf_dir, &libbpf_headers_dir);
+        cmd.stdout(Stdio::null());
+        exec(&mut cmd)?;
 
         let bpf_dir = manifest_dir.join("bpf");
 
@@ -135,13 +137,31 @@ fn main() -> Result<()> {
             cmd
         };
 
+        let rerun_if_changed = |path: &Path| {
+            use std::{io::Write as _, os::unix::ffi::OsStrExt as _};
+
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all("cargo:rerun-if-changed=".as_bytes())?;
+            stdout.write_all(path.as_os_str().as_bytes())?;
+            stdout.write_all("\n".as_bytes())?;
+
+            Ok(())
+        };
+
+        for hdr in C_BPF_HEADERS {
+            let hdr = bpf_dir.join(hdr);
+            let exists = hdr
+                .try_exists()
+                .with_context(|| format!("{}", hdr.display()))?;
+            anyhow::ensure!(exists, "{}", hdr.display());
+            rerun_if_changed(&hdr).with_context(|| format!("{}", hdr.display()))?;
+        }
+
         for (src, build_btf) in C_BPF {
             let dst = out_dir.join(src).with_extension("o");
             let src = bpf_dir.join(src);
-            {
-                let src = src.to_str().with_context(|| format!("{src:?}"))?;
-                println!("cargo:rerun-if-changed={src}");
-            }
+
+            rerun_if_changed(&src).with_context(|| format!("{}", src.display()))?;
 
             exec(clang().arg(&src).arg("-o").arg(&dst))?;
 
@@ -169,7 +189,8 @@ fn main() -> Result<()> {
                         .arg("--dump-section")
                         .arg(output)
                         .arg("-")
-                        .stdin(stdout),
+                        .stdin(stdout)
+                        .stdout(Stdio::null()),
                 )?;
 
                 let output = child
@@ -186,10 +207,11 @@ fn main() -> Result<()> {
     } else {
         for (src, build_btf) in C_BPF {
             let dst = out_dir.join(src).with_extension("o");
-            fs::write(&dst, []).with_context(|| format!("failed to create {dst:?}"))?;
+            fs::write(&dst, []).with_context(|| format!("failed to create {}", dst.display()))?;
             if *build_btf {
                 let dst = dst.with_extension("target.o");
-                fs::write(&dst, []).with_context(|| format!("failed to create {dst:?}"))?;
+                fs::write(&dst, [])
+                    .with_context(|| format!("failed to create {}", dst.display()))?;
             }
         }
 
@@ -199,7 +221,7 @@ fn main() -> Result<()> {
                 continue;
             }
             let dst = out_dir.join(name);
-            fs::write(&dst, []).with_context(|| format!("failed to create {dst:?}"))?;
+            fs::write(&dst, []).with_context(|| format!("failed to create {}", dst.display()))?;
         }
     }
     Ok(())

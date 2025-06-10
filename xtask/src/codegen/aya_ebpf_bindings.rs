@@ -1,8 +1,6 @@
 use std::{
-    ffi::OsString,
     fs::{File, create_dir_all},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{Context as _, Result};
@@ -10,13 +8,11 @@ use aya_tool::bindgen;
 use proc_macro2::TokenStream;
 use quote::ToTokens as _;
 use syn::{Item, parse_str};
+use xtask::{exec, install_libbpf_headers_cmd};
 
-use crate::{
-    codegen::{
-        Architecture, SysrootOptions,
-        helpers::{expand_helpers, extract_helpers},
-    },
-    exec,
+use crate::codegen::{
+    Architecture, SysrootOptions,
+    helpers::{expand_helpers, extract_helpers},
 };
 
 pub fn codegen(opts: &SysrootOptions, libbpf_dir: &Path) -> Result<()> {
@@ -34,17 +30,8 @@ pub fn codegen(opts: &SysrootOptions, libbpf_dir: &Path) -> Result<()> {
     let tmp_dir = tempfile::tempdir().context("tempdir failed")?;
     let libbpf_headers_dir = tmp_dir.path().join("libbpf_headers");
 
-    let mut includedir = OsString::new();
-    includedir.push("INCLUDEDIR=");
-    includedir.push(&libbpf_headers_dir);
-
-    exec(
-        Command::new("make")
-            .arg("-C")
-            .arg(libbpf_dir.join("src"))
-            .arg(includedir)
-            .arg("install_headers"),
-    )?;
+    let mut cmd = install_libbpf_headers_cmd(libbpf_dir, &libbpf_headers_dir);
+    exec(&mut cmd)?;
 
     let dir = PathBuf::from("ebpf/aya-ebpf-bindings");
 

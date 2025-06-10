@@ -14,8 +14,8 @@ use libc::{MAP_SHARED, PROT_READ, PROT_WRITE};
 use thiserror::Error;
 
 use crate::{
-    maps::MMap,
     sys::{PerfEventIoctlRequest, SyscallError, perf_event_ioctl, perf_event_open_bpf},
+    util::MMap,
 };
 
 /// Perf buffer error.
@@ -126,7 +126,7 @@ impl PerfBuffer {
     }
 
     fn buf(&self) -> ptr::NonNull<perf_event_mmap_page> {
-        self.mmap.ptr.cast()
+        self.mmap.ptr().cast()
     }
 
     pub(crate) fn readable(&self) -> bool {
@@ -290,7 +290,7 @@ mod tests {
         override_syscall(|call| match call {
             Syscall::PerfEventOpen { .. } => Ok(crate::MockableFd::mock_signed_fd().into()),
             Syscall::PerfEventIoctl { .. } => Ok(0),
-            call => panic!("unexpected syscall: {:?}", call),
+            call => panic!("unexpected syscall: {call:?}"),
         });
         TEST_MMAP_RET.with(|ret| *ret.borrow_mut() = buf.cast());
     }

@@ -14,7 +14,7 @@ use aya_obj::programs::XdpAttachType;
 use test_log::test;
 
 const MAX_RETRIES: usize = 100;
-const RETRY_DURATION: Duration = Duration::from_millis(10);
+pub(crate) const RETRY_DURATION: Duration = Duration::from_millis(10);
 
 #[test]
 fn long_name() {
@@ -160,7 +160,7 @@ fn assert_loaded_and_linked(name: &str) {
             // program in the middle of a `loaded_programs()` call.
             loaded_links()
                 .filter_map(|link| link.ok())
-                .find_map(|link| (link.prog_id == prog_id).then_some(link.id))
+                .find_map(|link| (link.program_id() == prog_id).then_some(link.id()))
         });
     assert!(
         poll_loaded_link_id

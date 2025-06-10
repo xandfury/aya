@@ -33,7 +33,7 @@ jobs:
 
       - run: git ls-files -- '*.c' '*.h' | xargs clang-format --dry-run --Werror
 
-      - uses: DavidAnson/markdownlint-cli2-action@v19
+      - uses: DavidAnson/markdownlint-cli2-action@v20
 
       - run: taplo fmt --check
 
@@ -50,6 +50,12 @@ jobs:
       - uses: peter-evans/create-pull-request@v7
         if: github.event_name != 'pull_request' && github.repository_owner == 'aya-rs'
         with:
+          # GitHub actions aren't allowed to trigger other actions to prevent
+          # abuse; the canonical workaround is to use a sufficiently authorized
+          # token.
+          #
+          # See https://github.com/peter-evans/create-pull-request/issues/48.
+          token: ${{ secrets.CRABBY_GITHUB_TOKEN }}
           branch: create-pull-request/public-api
           commit-message: 'public-api: regenerate'
           title: 'public-api: regenerate'
@@ -301,12 +307,12 @@ jobs:
       - name: Download debian kernels
         if: runner.arch == 'ARM64'
         # TODO: enable tests on kernels before 6.0.
-        run: .github/scripts/download_kernel_images.sh test/.tmp/debian-kernels/arm64 arm64 6.1 6.10
+        run: .github/scripts/download_kernel_images.sh test/.tmp/debian-kernels/arm64 arm64 6.1 6.12
 
       - name: Download debian kernels
         if: runner.arch == 'X64'
         # TODO: enable tests on kernels before 6.0.
-        run: .github/scripts/download_kernel_images.sh test/.tmp/debian-kernels/amd64 amd64 6.1 6.10
+        run: .github/scripts/download_kernel_images.sh test/.tmp/debian-kernels/amd64 amd64 6.1 6.12
 
       - name: Cleanup stale kernels and modules
         run: |
@@ -332,10 +338,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euxo pipefail
-          ARGS=$(./.github/scripts/find_kernels.py)
+          .github/scripts/find_kernels.py | xargs -t -0 \
           cargo xtask integration-test vm --cache-dir test/.tmp \
             --github-api-token ${{ secrets.GITHUB_TOKEN }} \
-            ${ARGS}
 
       - name: Run virtualized integration tests
         if: runner.os == 'macOS'
@@ -344,10 +349,9 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
         run: |
           set -euxo pipefail
-          ARGS=$(./.github/scripts/find_kernels.py)
+          .github/scripts/find_kernels.py | xargs -t -0 \
           cargo xtask integration-test vm --cache-dir test/.tmp \
             --github-api-token ${{ secrets.GITHUB_TOKEN }} \
-            ${ARGS}
 
   # Provides a single status check for the entire build workflow.
   # This is used for merge automation, like Mergify, since GH actions
