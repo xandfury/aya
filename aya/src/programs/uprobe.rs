@@ -12,7 +12,7 @@ use std::{
 
 use aya_obj::generated::{bpf_link_type, bpf_prog_type::BPF_PROG_TYPE_KPROBE};
 use libc::pid_t;
-use object::{Object as _, ObjectSection as _, ObjectSymbol as _, Symbol};
+use object::{elf::{FileHeader64, SectionHeader64, Sym64}, read::elf::ElfFile64, Endianness, Object as _, ObjectSection as _, ObjectSymbol as _, ObjectSymbolTable, Symbol};
 use thiserror::Error;
 
 use crate::{
@@ -121,10 +121,14 @@ impl UProbe {
         };
         let offset = if let Some(symbol) = symbol {
             let symbol_offset =
-                resolve_symbol(path, symbol).map_err(|error| UProbeError::SymbolError {
+            resolve_symbol_with_raw_elf(path, symbol).map_err(|error| UProbeError::SymbolError {
                     symbol: symbol.to_string(),
                     error: Box::new(error),
                 })?;
+                // resolve_symbol(path, symbol).map_err(|error| UProbeError::SymbolError {
+                //     symbol: symbol.to_string(),
+                //     error: Box::new(error),
+                // })?;
             symbol_offset + offset
         } else {
             offset
@@ -697,6 +701,54 @@ fn resolve_symbol(path: &Path, symbol: &str) -> Result<u64, ResolveSymbolError> 
         symbol_translated_address(&debug_obj, sym, symbol)
     }
 }
+
+fn resolve_symbol_with_raw_elf(path: &Path, symbol: &str) -> Result<u64, ResolveSymbolError> {
+    let data = fs::read(path)?;
+    
+    // Parse as ELF64 specifically
+    let elf = ElfFile64::<Endianness>::parse(&*data)?;
+    
+    // Get the raw ELF file header
+    let elf_header: &FileHeader64<Endianness> = elf.elf_header();
+    
+    // Find symbol in symbol table
+    for symbol_table in elf.symbol_table() {
+        for symbol_entry in symbol_table.symbols() {
+            if let Ok(sym_name) = symbol_entry.name() {
+                if sym_name == symbol {
+                    // Get the raw symbol structure
+                    let raw_symbol: &Sym64<Endianness> = symbol_entry.elf_symbol();
+                    
+                    // Get section index
+                    let section_index = raw_symbol.st_shndx.get(elf.endian());
+                    
+                    // Get the section header
+                    let section = elf.section_by_index(object::SectionIndex(section_index as usize))?;
+                    let raw_section: &SectionHeader64<Endianness> = section.elf_section_header();
+                    
+                    // Now you have access to the raw ELF structures:
+                    let symbol_virtual_addr = raw_symbol.st_value.get(elf.endian());
+                    let section_virtual_addr = raw_section.sh_addr.get(elf.endian());
+                    let section_file_offset = raw_section.sh_offset.get(elf.endian());
+                    
+                    // Apply the formula
+                    let file_offset = symbol_virtual_addr - section_virtual_addr + section_file_offset;
+                    
+                    println!("Raw ELF access:");
+                    println!("  st_value: 0x{:x}", symbol_virtual_addr);
+                    println!("  sh_addr: 0x{:x}", section_virtual_addr);  
+                    println!("  sh_offset: 0x{:x}", section_file_offset);
+                    println!("  file_offset: 0x{:x}", file_offset);
+                    
+                    return Ok(file_offset);
+                }
+            }
+        }
+    }
+    
+    Err(ResolveSymbolError::Unknown(symbol.to_string()))
+}
+
 
 fn symbol_translated_address(
     obj: &object::File<'_>,
