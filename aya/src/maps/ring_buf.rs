@@ -9,7 +9,7 @@ use std::{
     fmt::{self, Debug, Formatter},
     mem,
     ops::Deref,
-    os::fd::{AsFd as _, AsRawFd, BorrowedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
@@ -83,9 +83,11 @@ use crate::{
 /// # Polling
 ///
 /// In the example above the implementations of poll(), poll.readable(), guard.inner_mut(), and
-/// guard.clear_ready() are not given. RingBuf implements the AsRawFd trait, so you can implement
-/// polling using any crate that can poll file descriptors, like epoll, mio etc. The above example
-/// API is motivated by that of [`tokio::io::unix::AsyncFd`].
+/// guard.clear_ready() are not given. RingBuf implements [`AsRawFd`], so you can implement polling
+/// using any crate that can poll file descriptors, like epoll, mio etc. The above example API is
+/// motivated by that of [`tokio::io::unix::AsyncFd`].
+///
+/// [`tokio::io::unix::AsyncFd`]: https://docs.rs/tokio/latest/tokio/io/unix/struct.AsyncFd.html
 #[doc(alias = "BPF_MAP_TYPE_RINGBUF")]
 pub struct RingBuf<T> {
     map: T,
@@ -130,15 +132,20 @@ impl<T> RingBuf<T> {
     }
 }
 
-/// Access to the RawFd can be used to construct an AsyncFd for use with epoll.
-impl<T: Borrow<MapData>> AsRawFd for RingBuf<T> {
-    fn as_raw_fd(&self) -> RawFd {
+impl<T: Borrow<MapData>> AsFd for RingBuf<T> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
         let Self {
             map,
             consumer: _,
             producer: _,
         } = self;
-        map.borrow().fd().as_fd().as_raw_fd()
+        map.borrow().fd().as_fd()
+    }
+}
+
+impl<T: Borrow<MapData>> AsRawFd for RingBuf<T> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_fd().as_raw_fd()
     }
 }
 

@@ -21,7 +21,7 @@ aya-log = { path = "../../aya-log", version = "^0.2.1", default-features = false
 aya-obj = { path = "../../aya-obj", version = "^0.2.1", default-features = false }
 env_logger = { workspace = true }
 epoll = { workspace = true }
-futures = { workspace = true, features = ["std"] }
+futures = { workspace = true, features = ["alloc"] }
 integration-common = { path = "../integration-common", features = ["user"] }
 libc = { workspace = true }
 log = { workspace = true }
@@ -33,7 +33,12 @@ rbpf = { workspace = true }
 scopeguard = { workspace = true }
 test-case = { workspace = true }
 test-log = { workspace = true, features = ["log"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "time",
+] }
 xdpilone = { workspace = true }
 
 [build-dependencies]

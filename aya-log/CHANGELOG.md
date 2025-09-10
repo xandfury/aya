@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### New Features
+
+- Add eBPF-side log level `AYA_LOG_LEVEL` allowing selective disabling of log
+  levels at load-time. Disabled levels are eliminated by the verifier, reducing
+  instruction count and avoiding program size limits when extensive logging is
+  present.
+
+### Breaking Changes
+
+- The implementation is now backed by a ring buffer rather than a perf event array. This should
+  improve performance but increases the minimum supported kernel version to 5.8.
+
+- Drop the built-in `tokio` dependency. Users must now BYOR (bring your own runtime).
+
 ## v0.2.1 (2024-10-09)
 
 ### Chore

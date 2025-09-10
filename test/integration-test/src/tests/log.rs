@@ -1,12 +1,9 @@
-use std::{
-    borrow::Cow,
-    sync::{Arc, Mutex},
-};
+use std::{borrow::Cow, sync::Mutex};
 
-use aya::{Ebpf, programs::UProbe};
+use aya::{Ebpf, EbpfLoader, maps::Array, programs::UProbe};
 use aya_log::EbpfLogger;
+use integration_common::log::{BUF_LEN, Buffer};
 use log::{Level, Log, Record};
-use test_log::test;
 
 #[unsafe(no_mangle)]
 #[inline(never)]
@@ -15,10 +12,10 @@ pub extern "C" fn trigger_ebpf_program() {
 }
 
 struct TestingLogger<F> {
-    log: F,
+    log: Mutex<F>,
 }
 
-impl<F: Send + Sync + Fn(&Record)> Log for TestingLogger<F> {
+impl<F: Send + FnMut(&Record)> Log for TestingLogger<F> {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         true
     }
@@ -27,6 +24,7 @@ impl<F: Send + Sync + Fn(&Record)> Log for TestingLogger<F> {
 
     fn log(&self, record: &Record) {
         let Self { log } = self;
+        let mut log = log.lock().unwrap();
         log(record);
     }
 }
@@ -38,28 +36,36 @@ struct CapturedLog<'a> {
     pub target: Cow<'a, str>,
 }
 
-#[test(tokio::test)]
-async fn log() {
+#[test_log::test]
+fn log() {
     let mut bpf = Ebpf::load(crate::LOG).unwrap();
 
-    let captured_logs = Arc::new(Mutex::new(Vec::new()));
     {
-        let captured_logs = captured_logs.clone();
-        EbpfLogger::init_with_logger(
-            &mut bpf,
-            TestingLogger {
-                log: move |record: &Record| {
-                    let mut logs = captured_logs.lock().unwrap();
-                    logs.push(CapturedLog {
-                        body: format!("{}", record.args()).into(),
-                        level: record.level(),
-                        target: record.target().to_string().into(),
-                    });
+        let buffer = bpf.map_mut("BUFFER").unwrap();
+        let mut buffer: Array<_, Buffer> = Array::try_from(buffer).unwrap();
+        buffer
+            .set(
+                0,
+                Buffer {
+                    buf: [0xff; BUF_LEN],
+                    len: 3,
                 },
-            },
-        )
-        .unwrap();
+                0,
+            )
+            .unwrap();
     }
+
+    let mut captured_logs = Vec::new();
+    let logger = TestingLogger {
+        log: Mutex::new(|record: &Record| {
+            captured_logs.push(CapturedLog {
+                body: format!("{}", record.args()).into(),
+                level: record.level(),
+                target: record.target().to_string().into(),
+            });
+        }),
+    };
+    let mut logger = EbpfLogger::init_with_logger(&mut bpf, &logger).unwrap();
 
     let prog: &mut UProbe = bpf.program_mut("test_log").unwrap().try_into().unwrap();
     prog.load().unwrap();
@@ -69,21 +75,9 @@ async fn log() {
     // Call the function that the uprobe is attached to, so it starts logging.
     trigger_ebpf_program();
 
-    let mut logs = 0;
-    let records = loop {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let records = captured_logs.lock().unwrap();
-        let len = records.len();
-        if len == 0 {
-            continue;
-        }
-        if len == logs {
-            break records;
-        }
-        logs = len;
-    };
+    logger.flush();
 
-    let mut records = records.iter();
+    let mut records = captured_logs.iter();
 
     assert_eq!(
         records.next(),
@@ -187,11 +181,126 @@ async fn log() {
     assert_eq!(
         records.next(),
         Some(&CapturedLog {
-            body: "42 43 44 45".into(),
+            body: "42 43 44 45 46 47 48".into(),
             level: Level::Debug,
             target: "log".into(),
         })
     );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: "variable length buffer: ffffff".into(),
+            level: Level::Info,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: format!("2KiB array: {}", "00".repeat(2048)).into(),
+            level: Level::Info,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: format!("4KiB array: {}", "00".repeat(4096)).into(),
+            level: Level::Info,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(records.next(), None);
+}
+
+#[test_log::test]
+fn log_level_only_error_warn() {
+    let level = aya_log::Level::Warn as u8;
+    let mut bpf = EbpfLoader::new()
+        .set_global(aya_log::LEVEL, &level, true /* must_exist */)
+        .load(crate::LOG)
+        .unwrap();
+
+    let mut captured_logs = Vec::new();
+    let logger = TestingLogger {
+        log: Mutex::new(|record: &Record| {
+            captured_logs.push(CapturedLog {
+                body: format!("{}", record.args()).into(),
+                level: record.level(),
+                target: record.target().to_string().into(),
+            });
+        }),
+    };
+    let mut logger = EbpfLogger::init_with_logger(&mut bpf, &logger).unwrap();
+
+    let prog: &mut UProbe = bpf.program_mut("test_log").unwrap().try_into().unwrap();
+    prog.load().unwrap();
+    prog.attach("trigger_ebpf_program", "/proc/self/exe", None, None)
+        .unwrap();
+
+    trigger_ebpf_program();
+    logger.flush();
+
+    let mut records = captured_logs.iter();
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: "69, 420, wao, 77616f".into(),
+            level: Level::Error,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(
+        records.next(),
+        Some(&CapturedLog {
+            body: "hex lc: 2f, hex uc: 2F".into(),
+            level: Level::Warn,
+            target: "log".into(),
+        })
+    );
+
+    assert_eq!(records.next(), None);
+}
+
+#[test_log::test]
+fn log_level_prevents_verif_fail() {
+    let level = aya_log::Level::Warn as u8;
+    let mut bpf = EbpfLoader::new()
+        .set_global(aya_log::LEVEL, &level, true /* must_exist */)
+        .load(crate::LOG)
+        .unwrap();
+
+    let mut captured_logs = Vec::new();
+    let logger = TestingLogger {
+        log: Mutex::new(|record: &Record| {
+            captured_logs.push(CapturedLog {
+                body: format!("{}", record.args()).into(),
+                level: record.level(),
+                target: record.target().to_string().into(),
+            });
+        }),
+    };
+    let mut logger = EbpfLogger::init_with_logger(&mut bpf, &logger).unwrap();
+
+    let prog: &mut UProbe = bpf
+        .program_mut("test_log_omission")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    prog.load().unwrap();
+    prog.attach("trigger_ebpf_program", "/proc/self/exe", None, None)
+        .unwrap();
+
+    trigger_ebpf_program();
+    logger.flush();
+
+    let mut records = captured_logs.iter();
 
     assert_eq!(records.next(), None);
 }

@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -18,11 +19,7 @@ use aya::{
 use aya_obj::generated::BPF_RINGBUF_HDR_SZ;
 use integration_common::ring_buf::Registers;
 use rand::Rng as _;
-use test_log::test;
-use tokio::{
-    io::unix::AsyncFd,
-    time::{Duration, sleep},
-};
+use tokio::io::{Interest, unix::AsyncFd};
 
 struct RingBufTest {
     _bpf: Ebpf,
@@ -151,7 +148,8 @@ pub extern "C" fn ring_buf_trigger_ebpf_program(arg: u64) {
 // to fill the ring_buf. We just ensure that the number of events we see is sane given
 // what the producer sees, and that the logic does not hang. This exercises interleaving
 // discards, successful commits, and drops due to the ring_buf being full.
-#[test(tokio::test(flavor = "multi_thread"))]
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn ring_buf_async_with_drops() {
     let WithData(
         RingBufTest {
@@ -162,7 +160,7 @@ async fn ring_buf_async_with_drops() {
         data,
     ) = WithData::new(RING_BUF_MAX_ENTRIES * 8);
 
-    let mut async_fd = AsyncFd::new(ring_buf).unwrap();
+    let mut async_fd = AsyncFd::with_interest(ring_buf, Interest::READABLE).unwrap();
 
     // Spawn the writer which internally will spawn many parallel writers.
     // Construct an AsyncFd from the RingBuf in order to receive readiness notifications.
@@ -178,49 +176,42 @@ async fn ring_buf_async_with_drops() {
             seen += 1;
         }
     };
-    use futures::future::{
-        Either::{Left, Right},
-        select,
-    };
-    let writer = futures::future::try_join_all(data.chunks(8).map(ToOwned::to_owned).map(|v| {
-        tokio::spawn(async {
-            for value in v {
-                ring_buf_trigger_ebpf_program(value);
-            }
-        })
-    }));
-    let readable = {
-        let mut writer = writer;
-        loop {
-            let readable = Box::pin(async_fd.readable_mut());
-            writer = match select(readable, writer).await {
-                Left((guard, writer)) => {
-                    let mut guard = guard.unwrap();
-                    process_ring_buf(guard.get_inner_mut());
-                    guard.clear_ready();
-                    writer
+    let mut writer =
+        futures::future::try_join_all(data.chunks(8).map(ToOwned::to_owned).map(|v| {
+            tokio::spawn(async {
+                for value in v {
+                    ring_buf_trigger_ebpf_program(value);
                 }
-                Right((writer, readable)) => {
-                    writer.unwrap();
-                    break readable;
-                }
+            })
+        }));
+    loop {
+        let readable = async_fd.readable_mut();
+        futures::pin_mut!(readable);
+        match futures::future::select(readable, &mut writer).await {
+            futures::future::Either::Left((guard, _writer)) => {
+                let mut guard = guard.unwrap();
+                process_ring_buf(guard.get_inner_mut());
+                guard.clear_ready();
             }
-        }
-    };
+            futures::future::Either::Right((writer, readable)) => {
+                writer.unwrap();
 
-    // If there's more to read, we should receive a readiness notification in a timely manner.
-    // If we don't then, then assert that there's nothing else to read. Note that it's important
-    // to wait some time before attempting to read, otherwise we may catch up with the producer
-    // before epoll has an opportunity to send a notification; our consumer thread can race
-    // with the kernel epoll check.
-    let sleep_fut = sleep(Duration::from_millis(10));
-    tokio::pin!(sleep_fut);
-    match select(sleep_fut, readable).await {
-        Left(((), _)) => {}
-        Right((guard, _)) => {
-            let mut guard = guard.unwrap();
-            process_ring_buf(guard.get_inner_mut());
-            guard.clear_ready();
+                // If there's more to read, we should receive a readiness notification in a timely
+                // manner.  If we don't then, then assert that there's nothing else to read. Note
+                // that it's important to wait some time before attempting to read, otherwise we may
+                // catch up with the producer before epoll has an opportunity to send a
+                // notification; our consumer thread can race with the kernel epoll check.
+                match tokio::time::timeout(Duration::from_millis(10), readable).await {
+                    Err(tokio::time::error::Elapsed { .. }) => (),
+                    Ok(guard) => {
+                        let mut guard = guard.unwrap();
+                        process_ring_buf(guard.get_inner_mut());
+                        guard.clear_ready();
+                    }
+                }
+
+                break;
+            }
         }
     }
 
@@ -243,7 +234,7 @@ async fn ring_buf_async_with_drops() {
         "seen={seen}, rejected={rejected}, dropped={dropped}, total={total}, max_seen={max_seen}, \
         max_rejected={max_rejected}, max_dropped={max_dropped}",
     );
-    assert_eq!(seen + rejected + dropped, total, "{facts}",);
+    assert_eq!(seen + rejected + dropped, total, "{facts}");
     assert!(
         (0u64..=max_dropped).contains(&dropped),
         "dropped={dropped} not in 0..={max_dropped}; {facts}",
@@ -258,7 +249,8 @@ async fn ring_buf_async_with_drops() {
     );
 }
 
-#[test(tokio::test(flavor = "multi_thread"))]
+#[tokio::test(flavor = "multi_thread")]
+#[test_log::test]
 async fn ring_buf_async_no_drop() {
     let WithData(
         RingBufTest {
@@ -280,14 +272,14 @@ async fn ring_buf_async_no_drop() {
             for (value, duration) in data {
                 // Sleep a tad so we feel confident that the consumer will keep up
                 // and no messages will be dropped.
-                sleep(duration).await;
+                tokio::time::sleep(duration).await;
                 ring_buf_trigger_ebpf_program(value);
             }
         })
     };
 
     // Construct an AsyncFd from the RingBuf in order to receive readiness notifications.
-    let mut async_fd = AsyncFd::new(ring_buf).unwrap();
+    let mut async_fd = AsyncFd::with_interest(ring_buf, Interest::READABLE).unwrap();
     // Note that unlike in the synchronous case where all of the entries are written before any of
     // them are read, in this case we expect all of the entries to make their way to userspace
     // because entries are being consumed as they are produced.
@@ -326,7 +318,7 @@ async fn ring_buf_async_no_drop() {
 // This test reproduces a bug where the ring buffer would not be notified of new entries if the
 // state was not properly synchronized between the producer and consumer. This would result in the
 // consumer never being woken up and the test hanging.
-#[test]
+#[test_log::test]
 fn ring_buf_epoll_wakeup() {
     let RingBufTest {
         mut ring_buf,
@@ -360,7 +352,8 @@ fn ring_buf_epoll_wakeup() {
 }
 
 // This test is like the above test but uses tokio and AsyncFd instead of raw epoll.
-#[test(tokio::test)]
+#[tokio::test]
+#[test_log::test]
 async fn ring_buf_asyncfd_events() {
     let RingBufTest {
         ring_buf,
@@ -368,7 +361,7 @@ async fn ring_buf_asyncfd_events() {
         _bpf,
     } = RingBufTest::new();
 
-    let mut async_fd = AsyncFd::new(ring_buf).unwrap();
+    let mut async_fd = AsyncFd::with_interest(ring_buf, Interest::READABLE).unwrap();
     let mut total_events = 0;
     let writer = WriterThread::spawn();
     while total_events < WriterThread::NUM_MESSAGES {

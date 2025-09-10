@@ -473,12 +473,18 @@ macro_rules! id_as_key {
 pub(crate) use id_as_key;
 
 macro_rules! define_link_wrapper {
-    (#[$doc1:meta] $wrapper:ident, #[$doc2:meta] $wrapper_id:ident, $base:ident, $base_id:ident, $program:ident,) => {
-        #[$doc2]
+    ($wrapper:ident, $wrapper_id:ident, $base:ident, $base_id:ident, $program:ident $(,)?) => {
+        /// The type returned by
+        #[doc = concat!("[`", stringify!($program), "::attach`]")]
+        /// . Can be passed to
+        #[doc = concat!("[`", stringify!($program), "::detach`]")]
+        /// .
         #[derive(Debug, Hash, Eq, PartialEq)]
         pub struct $wrapper_id($base_id);
 
-        #[$doc1]
+        /// The link used by
+        #[doc = concat!("[`", stringify!($program), "`]")]
+        /// programs.
         #[derive(Debug)]
         pub struct $wrapper(Option<$base>);
 
@@ -546,7 +552,9 @@ macro_rules! define_link_wrapper {
             /// Takes ownership of the link referenced by the provided `link_id`.
             ///
             /// The caller takes the responsibility of managing the lifetime of the link. When the
-            /// returned [`$wrapper`] is dropped, the link is detached.
+            /// returned
+            #[doc = concat!("[`", stringify!($wrapper), "`]")]
+            /// is dropped, the link will be detached.
             pub fn take_link(&mut self, link_id: $wrapper_id) -> Result<$wrapper, ProgramError> {
                 self.data.links.forget(link_id)
             }
